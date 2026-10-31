@@ -5,7 +5,7 @@
 #include <string.h>
 #include "stream_server.h"
 #include "capture.h"
-#include "usb_comms.h"
+#include "usb_link.h"
 #include "../../protocol/swlink_protocol.h"
 
 #define HANDSHAKE_TIMEOUT 1E+9  /* 1s */
@@ -35,7 +35,7 @@ static bool sendPacket(const void* data, size_t length)
     if (!clientConnected())
         success = false;
     else
-        success = usbCommsWrite(USB_INTF_STREAM, data, length, SEND_TIMEOUT) == length;
+        success = swlinkUsbWrite(USB_INTF_STREAM, data, length, SEND_TIMEOUT) == length;
     mutexUnlock(&sendMutex);
 
     return success;
@@ -48,14 +48,14 @@ static bool connectClient(void)
 
     /* 循环发 HELLO 直到主机收到 */
     do
-        num = usbCommsWrite(USB_INTF_STREAM, SWLINK_HELLO, sizeof(SWLINK_HELLO), HANDSHAKE_TIMEOUT);
+        num = swlinkUsbWrite(USB_INTF_STREAM, SWLINK_HELLO, sizeof(SWLINK_HELLO), HANDSHAKE_TIMEOUT);
     while (num == 0 && g_streamRunning);
 
     if (num != sizeof(SWLINK_HELLO) || !g_streamRunning)
         return false;
 
     SwlinkHandshakeRequest req;
-    if (usbCommsRead(USB_INTF_STREAM, &req, sizeof(req), HANDSHAKE_TIMEOUT) != sizeof(req))
+    if (swlinkUsbRead(USB_INTF_STREAM, &req, sizeof(req), HANDSHAKE_TIMEOUT) != sizeof(req))
         return false;
 
     SwlinkHandshakeResponse resp = { 0 };
@@ -67,7 +67,7 @@ static bool connectClient(void)
     else
         resp.code = SWLINK_HANDSHAKE_OK;
 
-    if (usbCommsWrite(USB_INTF_STREAM, &resp, sizeof(resp), HANDSHAKE_TIMEOUT) != sizeof(resp))
+    if (swlinkUsbWrite(USB_INTF_STREAM, &resp, sizeof(resp), HANDSHAKE_TIMEOUT) != sizeof(resp))
         return false;
 
     if (resp.code != SWLINK_HANDSHAKE_OK)

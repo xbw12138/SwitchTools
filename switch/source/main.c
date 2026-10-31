@@ -7,7 +7,7 @@
 #include <string.h>
 #include <switch.h>
 
-#include "usb_comms.h"
+#include "usb_link.h"
 #include "capture.h"
 #include "stream_server.h"
 #include "file_server.h"
@@ -86,7 +86,7 @@ int main(void)
     if (R_FAILED(rc))
         fatalThrow(rc);
 
-    rc = usbCommsInitialize();
+    rc = swlinkUsbInitialize();
     if (R_FAILED(rc))
         fatalThrow(rc);
 
@@ -116,7 +116,7 @@ int main(void)
     threadWaitForExit(&fileThread);
     threadClose(&fileThread);
 
-    usbCommsExit();
+    swlinkUsbExit();
     captureFinalize();
 
     return 0;

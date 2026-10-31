@@ -24,14 +24,13 @@ static Mutex grcdBeginMutex;
 static bool forceSPSPPS = false;
 static int audioBatching = 3;
 
-enum { GrcStream_Video = 0, GrcStream_Audio = 1 };
 
-static Result grcdCmdNoIO(Service* srv, u32 cmd_id)
+static Result grcBeginCmd(Service* srv, u32 cmd_id)
 {
     return serviceDispatch(srv, cmd_id);
 }
 
-static Result grcdTransfer(Service* srv, u32 stream, void* buffer, size_t size, u32* data_size, u64* start_timestamp)
+static Result grcTransferCmd(Service* srv, u32 stream, void* buffer, size_t size, u32* data_size, u64* start_timestamp)
 {
     struct {
         u32 num_frames;
@@ -61,7 +60,7 @@ static bool ensureGrcdInit(Result* rc)
     }
 
     grcdBeginCalled = true;
-    *rc = grcdCmdNoIO(&grcdVideo, 1);
+    *rc = grcBeginCmd(&grcdVideo, 1);
 
     mutexUnlock(&grcdBeginMutex);
     return true;
@@ -126,7 +125,7 @@ bool captureReadVideo(void)
     u32 dataSize = 0;
     u64 timestamp = 0;
 
-    Result rc = grcdTransfer(&grcdVideo, GrcStream_Video,
+    Result rc = grcTransferCmd(&grcdVideo, GrcStream_Video,
         VPkt.data, SWLINK_VIDEO_BUF_SIZE, &dataSize, &timestamp);
 
     if (rc == GRCD_NOT_INITIALIZED && ensureGrcdInit(&rc)) {
@@ -172,7 +171,7 @@ bool captureReadAudio(void)
     u32 dataSize = 0;
     u64 timestamp = 0;
 
-    Result rc = grcdTransfer(&grcdAudio, GrcStream_Audio,
+    Result rc = grcTransferCmd(&grcdAudio, GrcStream_Audio,
         APkt.data, SWLINK_AUDIO_CHUNK, &dataSize, &timestamp);
 
     if (rc == GRCD_NOT_INITIALIZED && ensureGrcdInit(&rc)) {
@@ -196,7 +195,7 @@ bool captureReadAudio(void)
     for (int i = 0; i < audioBatching; i++) {
         u32 tmpSize = 0;
 
-        rc = grcdTransfer(&grcdAudio, GrcStream_Audio,
+        rc = grcTransferCmd(&grcdAudio, GrcStream_Audio,
             APkt.data + APkt.header.data_size, SWLINK_AUDIO_CHUNK, &tmpSize, NULL);
 
         if (!R_SUCCEEDED(rc)) {

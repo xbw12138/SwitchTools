@@ -13,16 +13,16 @@ enum {
 };
 
 /* 初始化 usb:ds,注册两个 vendor-specific 接口并使能设备 */
-Result usbCommsInitialize(void);
+Result swlinkUsbInitialize(void);
 
 /* 关闭所有接口并退出 usb:ds */
-void usbCommsExit(void);
+void swlinkUsbExit(void);
 
 /*
  * 从指定接口的 OUT 端点读取,返回实际读取字节数。
  * timeout 单位纳秒;超时返回已读到的字节数(可能为 0)。
  */
-size_t usbCommsRead(u32 interface, void* buffer, size_t size, u64 timeout);
+size_t swlinkUsbRead(u32 interface, void* buffer, size_t size, u64 timeout);
 
 /* 向指定接口的 IN 端点写入,返回实际写入字节数 */
-size_t usbCommsWrite(u32 interface, const void* buffer, size_t size, u64 timeout);
+size_t swlinkUsbWrite(u32 interface, const void* buffer, size_t size, u64 timeout);

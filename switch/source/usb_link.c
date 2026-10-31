@@ -4,7 +4,7 @@
  * 接口 0 = 串流, 接口 1 = 文件传输
  */
 #include <string.h>
-#include "usb_comms.h"
+#include "usb_link.h"
 #include "../../protocol/swlink_protocol.h"
 
 typedef struct {
@@ -119,7 +119,7 @@ static Result _interfaceInit5x(u32 intf_ind)
     return rc;
 }
 
-Result usbCommsInitialize(void)
+Result swlinkUsbInitialize(void)
 {
     Result rc = 0;
     rwlockWriteLock(&g_global_lock);
@@ -192,12 +192,12 @@ Result usbCommsInitialize(void)
 
     rwlockWriteUnlock(&g_global_lock);
 
-    if (R_FAILED(rc)) usbCommsExit();
+    if (R_FAILED(rc)) swlinkUsbExit();
 
     return rc;
 }
 
-void usbCommsExit(void)
+void swlinkUsbExit(void)
 {
     rwlockWriteLock(&g_global_lock);
 
@@ -334,7 +334,7 @@ static Result _write(UsbCommsInterface* interface, u8* stage_buf, const void* bu
     return rc;
 }
 
-size_t usbCommsRead(u32 interface, void* buffer, size_t size, u64 timeout)
+size_t swlinkUsbRead(u32 interface, void* buffer, size_t size, u64 timeout)
 {
     size_t transferredSize = 0;
     u32 state = 0;
@@ -366,7 +366,7 @@ size_t usbCommsRead(u32 interface, void* buffer, size_t size, u64 timeout)
     return transferredSize;
 }
 
-size_t usbCommsWrite(u32 interface, const void* buffer, size_t size, u64 timeout)
+size_t swlinkUsbWrite(u32 interface, const void* buffer, size_t size, u64 timeout)
 {
     size_t transferredSize = 0;
     u32 state = 0;

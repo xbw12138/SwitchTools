@@ -4,7 +4,7 @@
  */
 #include <string.h>
 #include "file_server.h"
-#include "usb_comms.h"
+#include "usb_link.h"
 #include "../../protocol/swlink_protocol.h"
 
 #define USB_TIMEOUT 3E+9
@@ -21,7 +21,7 @@ void fileServerInit(FsFileSystem* sd)
 static u32 mapError(Result rc)
 {
     if (R_SUCCEEDED(rc)) return SWLINK_FT_OK;
-    if (R_DESCRIPTION(rc) == FsError_PathNotFound) return SWLINK_FT_ERR_NOT_FOUND;
+    if (rc == 0x202) return SWLINK_FT_ERR_NOT_FOUND;
     return SWLINK_FT_ERR_IO;
 }
 
@@ -53,7 +53,7 @@ static size_t respond(SwlinkFtHeader* resp, const void* payload, u32 payload_len
     /* 处理函数可能已直接在 g_buf payload 区构建数据,避免同地址拷贝 */
     if (payload_len && (const u8*)payload != g_buf + sizeof(SwlinkFtHeader))
         memcpy(g_buf + sizeof(SwlinkFtHeader), payload, payload_len);
-    return usbCommsWrite(USB_INTF_FILE, g_buf, total, USB_TIMEOUT) == total ? total : 0;
+    return swlinkUsbWrite(USB_INTF_FILE, g_buf, total, USB_TIMEOUT) == total ? total : 0;
 }
 
 /* LIST: 请求 offset 为起始条目索引;响应 offset 为下一索引(0 表示读完) */
@@ -80,7 +80,7 @@ static u32 handleList(SwlinkFtHeader* resp, const char* path, u64 startIndex)
         /* 64 条最大名字 0x300 时总长约 50KB,远小于 CHUNK,无需检查容量 */
         u16 name_len = (u16)strlen(ent.name);
         u8 type = (ent.type == FsDirEntryType_Dir) ? 1 : 2;
-        u64 size = (u64)ent.fileSize;
+        u64 size = (u64)ent.file_size;
 
         memcpy(w, &type, 1);      w += 1;
         memcpy(w, &size, 8);      w += 8;
@@ -176,7 +176,7 @@ static u32 handleMkdir(SwlinkFtHeader* resp, const char* path)
 {
     Result rc = fsFsCreateDirectory(&g_sd, path);
     /* 已存在视为成功,幂等 */
-    if (R_FAILED(rc) && R_DESCRIPTION(rc) != FsError_PathAlreadyExists)
+    if (R_FAILED(rc) && rc != 0x402)
         return mapError(rc);
     return respond(resp, NULL, 0) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
 }
@@ -220,7 +220,7 @@ void fileServerThread(void* arg)
 
     while (g_fileRunning) {
         SwlinkFtHeader req;
-        size_t got = usbCommsRead(USB_INTF_FILE, &req, sizeof(req), USB_TIMEOUT);
+        size_t got = swlinkUsbRead(USB_INTF_FILE, &req, sizeof(req), USB_TIMEOUT);
         if (got != sizeof(req)) continue;   /* 超时重来 */
 
         SwlinkFtHeader resp = req;          /* magic/cmd/seq 回显 */
@@ -236,7 +236,7 @@ void fileServerThread(void* arg)
 
         u8* payload = g_buf + sizeof(SwlinkFtHeader);
         if (req.payload_len) {
-            got = usbCommsRead(USB_INTF_FILE, payload, req.payload_len, USB_TIMEOUT);
+            got = swlinkUsbRead(USB_INTF_FILE, payload, req.payload_len, USB_TIMEOUT);
             if (got != req.payload_len) continue;
         }
 
