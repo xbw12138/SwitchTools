@@ -44,9 +44,14 @@ cd switch && make
 ## 二、macOS 客户端构建
 
 ```sh
-cd mac && ./setup.sh     # 自动装 brew 依赖(cmake/sdl2/ffmpeg/libusb)并构建
+cd mac && ./setup.sh     # 装 brew 依赖(cmake/sdl2/libusb/pkg-config) + 编译内置精简 ffmpeg
 ./build/swlink
 ```
+
+> ffmpeg 不通过 Homebrew 安装:旧版 macOS(如 12)上 brew 没有预编译包,源码编译还会
+> 连带 Python 等重型依赖。`setup.sh` 会自行下载 ffmpeg 7.1 并只编译 h264 解码器,
+> 安装到 `mac/third_party/ffmpeg`(不入库)。依赖装好后日常只需
+> `cmake --build build -j`。
 
 ## 三、使用
 

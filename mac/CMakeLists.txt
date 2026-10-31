@@ -4,6 +4,10 @@ project(swlink CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# 项目内置的精简 ffmpeg (brew 在旧版 macOS 上装不上, 见 setup.sh)
+list(APPEND CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/third_party/ffmpeg")
+set(ENV{PKG_CONFIG_PATH} "${CMAKE_SOURCE_DIR}/third_party/ffmpeg/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL2 REQUIRED sdl2)
 pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
