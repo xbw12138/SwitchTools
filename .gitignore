@@ -1,0 +1,16 @@
+# 构建产物
+build/
+switch/build/
+mac/build/
+*.nsp
+*.nso
+*.npdm
+*.elf
+*.nacp
+
+# macOS
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/

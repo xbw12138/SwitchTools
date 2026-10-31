@@ -1,0 +1,206 @@
+/*
+ * file_client.cpp
+ */
+#include "file_client.hpp"
+#include "usb_link.hpp"
+#include "../../protocol/swlink_protocol.h"
+
+#include <cstring>
+#include <cstdio>
+
+#define USB_TIMEOUT_MS 10000
+
+std::vector<uint8_t> FileClient::packPath(const std::string& path)
+{
+    std::vector<uint8_t> out(2 + path.size());
+    uint16_t len = (uint16_t)path.size();
+    memcpy(out.data(), &len, 2);
+    memcpy(out.data() + 2, path.data(), path.size());
+    return out;
+}
+
+bool FileClient::request(uint32_t cmd, uint64_t offset, uint64_t size,
+                         const std::vector<uint8_t>& payload,
+                         std::vector<uint8_t>& respPayload,
+                         uint64_t* respOffset, uint64_t* respSize)
+{
+    SwlinkFtHeader hdr = {};
+    hdr.magic = SWLINK_FT_MAGIC;
+    hdr.cmd = cmd;
+    hdr.seq = ++seq_;
+    hdr.offset = offset;
+    hdr.size = size;
+    hdr.payload_len = (uint32_t)payload.size();
+
+    if (!link_.fileWrite(&hdr, sizeof(hdr), USB_TIMEOUT_MS) ||
+        (hdr.payload_len && !link_.fileWrite(payload.data(), hdr.payload_len, USB_TIMEOUT_MS))) {
+        err_ = "发送请求失败";
+        return false;
+    }
+
+    SwlinkFtHeader resp = {};
+    if (!link_.fileRead(&resp, sizeof(resp), USB_TIMEOUT_MS) || resp.magic != SWLINK_FT_MAGIC) {
+        err_ = "接收响应头失败";
+        return false;
+    }
+
+    respPayload.resize(resp.payload_len);
+    if (resp.payload_len && !link_.fileRead(respPayload.data(), resp.payload_len, USB_TIMEOUT_MS)) {
+        err_ = "接收响应数据失败";
+        return false;
+    }
+
+    if (resp.status != SWLINK_FT_OK) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "设备错误 %u", resp.status);
+        err_ = buf;
+        return false;
+    }
+
+    if (respOffset) *respOffset = resp.offset;
+    if (respSize) *respSize = resp.size;
+    return true;
+}
+
+bool FileClient::ping()
+{
+    std::vector<uint8_t> out;
+    return request(SwlinkFt_Ping, 0, 0, {}, out);
+}
+
+bool FileClient::list(const std::string& path, std::vector<FtEntry>& out)
+{
+    out.clear();
+    uint64_t startIndex = 0;
+
+    for (;;) {
+        std::vector<uint8_t> payload;
+        uint64_t next = 0;
+        if (!request(SwlinkFt_List, startIndex, 0, packPath(path), payload, &next))
+            return false;
+
+        const uint8_t* p = payload.data();
+        const uint8_t* end = p + payload.size();
+        while (p + 11 <= end) {
+            FtEntry e;
+            e.type = p[0];
+            memcpy(&e.size, p + 1, 8);
+            uint16_t nl;
+            memcpy(&nl, p + 9, 2);
+            p += 11;
+            if (p + nl > end) break;
+            e.name.assign((const char*)p, nl);
+            p += nl;
+            out.push_back(std::move(e));
+        }
+
+        if (next == 0) break;   /* 读完 */
+        startIndex = next;
+    }
+    return true;
+}
+
+bool FileClient::stat(const std::string& path, uint8_t& type, uint64_t& size)
+{
+    std::vector<uint8_t> payload;
+    if (!request(SwlinkFt_Stat, 0, 0, packPath(path), payload))
+        return false;
+    if (payload.size() < 9) { err_ = "响应过短"; return false; }
+    type = payload[0];
+    memcpy(&size, payload.data() + 1, 8);
+    return true;
+}
+
+bool FileClient::readFile(const std::string& remote, const std::string& local, ProgressCb cb)
+{
+    uint8_t type;
+    uint64_t total = 0;
+    if (!stat(remote, type, total)) return false;
+    if (type != 2) { err_ = "不是文件"; return false; }
+
+    FILE* f = fopen(local.c_str(), "wb");
+    if (!f) { err_ = "无法创建本地文件"; return false; }
+
+    uint64_t done = 0;
+    bool ok = true;
+    while (done < total) {
+        uint64_t want = total - done;
+        if (want > SWLINK_FT_CHUNK) want = SWLINK_FT_CHUNK;
+
+        std::vector<uint8_t> payload;
+        uint64_t got = 0;
+        if (!request(SwlinkFt_Read, done, want, packPath(remote), payload, nullptr, &got)) {
+            ok = false;
+            break;
+        }
+        if (got == 0) break;    /* 异常提前结束 */
+
+        fwrite(payload.data(), 1, got, f);
+        done += got;
+        if (cb) cb(done, total);
+    }
+
+    fclose(f);
+    if (!ok) std::remove(local.c_str());
+    return ok;
+}
+
+bool FileClient::writeFile(const std::string& local, const std::string& remote, ProgressCb cb)
+{
+    FILE* f = fopen(local.c_str(), "rb");
+    if (!f) { err_ = "无法打开本地文件"; return false; }
+
+    fseek(f, 0, SEEK_END);
+    uint64_t total = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    uint64_t done = 0;
+    bool ok = true;
+    while (done < total) {
+        uint64_t want = total - done;
+        if (want > SWLINK_FT_CHUNK) want = SWLINK_FT_CHUNK;
+
+        /* payload = [u16 len][path][data...] */
+        std::vector<uint8_t> payload = packPath(remote);
+        size_t pathBytes = payload.size();
+        payload.resize(pathBytes + want);
+        if (fread(payload.data() + pathBytes, 1, want, f) != want) {
+            err_ = "读取本地文件失败";
+            ok = false;
+            break;
+        }
+
+        std::vector<uint8_t> resp;
+        if (!request(SwlinkFt_Write, done, want, payload, resp)) {
+            ok = false;
+            break;
+        }
+
+        done += want;
+        if (cb) cb(done, total);
+    }
+
+    fclose(f);
+    return ok;
+}
+
+bool FileClient::mkdir(const std::string& path)
+{
+    std::vector<uint8_t> out;
+    return request(SwlinkFt_Mkdir, 0, 0, packPath(path), out);
+}
+
+bool FileClient::remove(const std::string& path, bool isDir)
+{
+    std::vector<uint8_t> out;
+    return request(SwlinkFt_Delete, isDir ? 1 : 0, 0, packPath(path), out);
+}
+
+bool FileClient::rename(const std::string& oldPath, const std::string& newPath)
+{
+    std::vector<uint8_t> payload = packPath(oldPath);
+    std::vector<uint8_t> np = packPath(newPath);
+    payload.insert(payload.end(), np.begin(), np.end());
+    std::vector<uint8_t> out;
+    return request(SwlinkFt_Rename, 0, 0, payload, out);
+}
