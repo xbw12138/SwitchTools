@@ -5,6 +5,10 @@
 #include <string.h>
 #include "capture.h"
 
+/* 来自 main.c 的日志器 (sysmodule 没有控制台) */
+extern void sdLog(const char* text);
+extern void sdLogRc(const char* tag, Result rc);
+
 VideoPacket alignas(0x1000) VPkt;
 AudioPacket alignas(0x1000) APkt;
 
@@ -61,6 +65,7 @@ static bool ensureGrcdInit(Result* rc)
 
     grcdBeginCalled = true;
     *rc = grcBeginCmd(&grcdVideo, 1);
+    sdLogRc("grc:d Begin", *rc);
 
     mutexUnlock(&grcdBeginMutex);
     return true;
@@ -139,6 +144,25 @@ bool captureReadVideo(void)
     VPkt.header.data_size = dataSize;
     VPkt.header.timestamp = timestamp;
     VPkt.header.flags = 0;
+
+    /* 运行时探针:前 5 帧记录 大小/NAL 类型,之后每 100 帧记录累计帧数与最近大小 */
+    static int okLog = 0, failLog = 0, totalFrames = 0;
+    if (R_SUCCEEDED(rc) && dataSize > 4) {
+        const u8 nalType = VPkt.data[4] & 0x1F;
+        totalFrames++;
+        if (okLog < 5) {
+            okLog++;
+            /* 高 24 位 = 帧大小, 低 8 位 = NAL 类型 (1=普通帧 5=IDR 7=SPS 8=PPS) */
+            sdLogRc("视频帧 大小<<8|NAL", (Result)(((u32)dataSize << 8) | nalType));
+        } else if (totalFrames % 100 == 0) {
+            sdLogRc("累计视频帧数", (Result)totalFrames);
+            sdLogRc("最近帧大小", (Result)dataSize);
+        }
+    } else if (failLog < 6) {
+        failLog++;
+        sdLogRc("视频 Transfer rc", rc);
+        sdLogRc("视频数据量", (Result)dataSize);
+    }
 
     /* dataSize <= 4 视为无效;0xcd4 (2212-0006) 表示缓冲过小,常见于超大 IDR */
     if (!R_SUCCEEDED(rc) || dataSize <= 4) {

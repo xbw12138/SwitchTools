@@ -4,8 +4,10 @@
  */
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -26,11 +28,16 @@ public:
     bool ping();
     bool list(const std::string& path, std::vector<FtEntry>& out);
     bool stat(const std::string& path, uint8_t& type, uint64_t& size);
+    bool statFs(const std::string& path, uint64_t& total, uint64_t& free);
     bool readFile(const std::string& remote, const std::string& local, ProgressCb cb = nullptr);
     bool writeFile(const std::string& local, const std::string& remote, ProgressCb cb = nullptr);
     bool mkdir(const std::string& path);
     bool remove(const std::string& path, bool isDir);
     bool rename(const std::string& oldPath, const std::string& newPath);
+
+    /* 取消标志:置 true 后分块循环会在下一个块检查时退出 */
+    void setCancelFlag(std::atomic<bool>* flag) { cancel_ = flag; }
+    bool cancelled() const { return cancel_ && cancel_->load(); }
 
     const std::string& lastError() const { return err_; }
 
@@ -46,4 +53,7 @@ private:
     UsbLink& link_;
     uint32_t seq_ = 0;
     std::string err_;
+    std::atomic<bool>* cancel_ = nullptr;
+    /* 请求-响应必须串行:传输线程与 UI 线程可能同时访问文件接口 */
+    std::mutex ioMutex_;
 };

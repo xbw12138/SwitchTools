@@ -98,6 +98,7 @@ typedef enum {
     SwlinkFt_Mkdir  = 5,
     SwlinkFt_Delete = 6, /* offset 低 1 位: 1 = 递归删除目录 */
     SwlinkFt_Rename = 7, /* payload: [u16 len][旧路径][u16 len][新路径] */
+    SwlinkFt_StatFs = 8, /* 请求 payload: 路径;响应 payload: [u64 total][u64 free] */
 } SwlinkFtCmd;
 
 /* 40 字节,请求与响应共用;响应中 status 非 0 即失败 */

@@ -29,7 +29,7 @@ void AudioOutput::shutdown()
 
 void AudioOutput::queue(const uint8_t* data, size_t len)
 {
-    if (!dev_) return;
+    if (!dev_ || muted_) return;
 
     /* 积压超 0.5s 时丢旧数据,优先保延迟 */
     Uint32 queued = SDL_GetQueuedAudioSize(dev_);
@@ -37,4 +37,17 @@ void AudioOutput::queue(const uint8_t* data, size_t len)
         SDL_ClearQueuedAudio(dev_);
 
     SDL_QueueAudio(dev_, data, (Uint32)len);
+}
+
+void AudioOutput::setMuted(bool muted)
+{
+    muted_ = muted;
+    if (!dev_) return;
+
+    if (muted) {
+        SDL_ClearQueuedAudio(dev_);
+        SDL_PauseAudioDevice(dev_, 1);
+    } else {
+        SDL_PauseAudioDevice(dev_, 0);
+    }
 }

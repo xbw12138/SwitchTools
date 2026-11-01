@@ -26,7 +26,12 @@ public:
 
     /* 精确长度读写;false = 出错或断开 */
     bool streamRead(void* data, int len, unsigned timeoutMs);
+    /* 单次批量读:返回实际收到的字节数,0 = 超时,<0 = 断开。
+       必须用大缓冲一次读够,小缓冲会把一个 USB 包剩余数据丢掉导致流错位 */
+    int streamReadSome(void* data, int maxLen, unsigned timeoutMs);
     bool fileRead(void* data, int len, unsigned timeoutMs);
+    /* 单次批量读,返回实际字节数(0=超时,<0=断开);响应头和负载必须一次读完 */
+    int fileReadSome(void* data, int maxLen, unsigned timeoutMs);
     bool fileWrite(const void* data, int len, unsigned timeoutMs);
 
     const char* lastError() const { return err_; }

@@ -27,6 +27,9 @@ public:
     /* UI 线程调用:有新帧则更新纹理;返回可渲染纹理(可能为 nullptr) */
     SDL_Texture* uploadIfDirty(SDL_Renderer* renderer);
 
+    /* 独立窗口调用:把最新 YUV 帧灌进外部纹理(纹理须为 IYUV/STREAMING) */
+    bool uploadInto(SDL_Texture* tex);
+
     int width() const { return w_; }
     int height() const { return h_; }
     uint64_t framesDecoded() const { return frames_; }

@@ -172,6 +172,19 @@ static u32 handleWrite(SwlinkFtHeader* resp, const char* path, u64 offset, u64 s
     return respond(resp, NULL, 0) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
 }
 
+static u32 handleStatFs(SwlinkFtHeader* resp, const char* path)
+{
+    s64 total = 0, freeSpace = 0;
+    Result rc = fsFsGetTotalSpace(&g_sd, path, &total);
+    if (R_FAILED(rc)) return mapError(rc);
+
+    rc = fsFsGetFreeSpace(&g_sd, path, &freeSpace);
+    if (R_FAILED(rc)) return mapError(rc);
+
+    struct { u64 total; u64 free; } st = { (u64)total, (u64)freeSpace };
+    return respond(resp, &st, sizeof(st)) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
+}
+
 static u32 handleMkdir(SwlinkFtHeader* resp, const char* path)
 {
     Result rc = fsFsCreateDirectory(&g_sd, path);
@@ -283,6 +296,10 @@ void fileServerThread(void* arg)
             break;
         case SwlinkFt_Rename:
             err = handleRename(&resp, payload, req.payload_len);
+            break;
+        case SwlinkFt_StatFs:
+            err = parsePath(payload, req.payload_len, path, sizeof(path), NULL);
+            if (err == SWLINK_FT_OK) err = handleStatFs(&resp, path);
             break;
         default:
             err = SWLINK_FT_ERR_BAD_REQUEST;

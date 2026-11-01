@@ -40,5 +40,5 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
 echo ""
-echo "构建完成: $PWD/build/swlink"
+echo "构建完成: $PWD/build/SwLink.app (双击即可运行)"
 echo "Switch 端 sysmodule 需用 devkitPro 构建,见 README.md"

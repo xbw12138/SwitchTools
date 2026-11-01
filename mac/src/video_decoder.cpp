@@ -19,6 +19,10 @@ bool VideoDecoder::init()
     ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
     ctx_->flags2 |= AV_CODEC_FLAG2_FAST;
 
+    /* 切片多线程:提高解码吞吐,同时避免帧级线程带来的额外延迟 */
+    ctx_->thread_count = 4;
+    ctx_->thread_type = FF_THREAD_SLICE;
+
     if (avcodec_open2(ctx_, codec_, nullptr) < 0) return false;
 
     frame_ = av_frame_alloc();
@@ -61,12 +65,19 @@ void VideoDecoder::feed(const uint8_t* data, size_t len)
                         h_ = frame_->height;
                         yuv_.resize((size_t)w_ * h_ * 3 / 2);
                         uint8_t* dst = yuv_.data();
+                        /* 逐平面一次拷贝走完(源为连续行,linesize 可能含填充,故按行) */
+                        const int planeW[3] = { w_, w_ / 2, w_ / 2 };
+                        const int planeH[3] = { h_, h_ / 2, h_ / 2 };
                         for (int p = 0; p < 3; p++) {
-                            int pw = (p == 0) ? w_ : w_ / 2;
-                            int ph = (p == 0) ? h_ : h_ / 2;
-                            for (int row = 0; row < ph; row++) {
-                                memcpy(dst, frame_->data[p] + row * frame_->linesize[p], pw);
-                                dst += pw;
+                            if (frame_->linesize[p] == planeW[p]) {
+                                memcpy(dst, frame_->data[p],
+                                       (size_t)planeW[p] * planeH[p]);
+                                dst += (size_t)planeW[p] * planeH[p];
+                            } else {
+                                for (int row = 0; row < planeH[p]; row++) {
+                                    memcpy(dst, frame_->data[p] + row * frame_->linesize[p], planeW[p]);
+                                    dst += planeW[p];
+                                }
                             }
                         }
                         dirty_ = true;
@@ -76,6 +87,20 @@ void VideoDecoder::feed(const uint8_t* data, size_t len)
             }
         }
     }
+}
+
+bool VideoDecoder::uploadInto(SDL_Texture* tex)
+{
+    if (!tex) return false;
+
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (w_ <= 0 || h_ <= 0 || yuv_.empty()) return false;
+
+    const uint8_t* y = yuv_.data();
+    const uint8_t* u = y + (size_t)w_ * h_;
+    const uint8_t* v = u + (size_t)w_ * h_ / 4;
+    SDL_UpdateYUVTexture(tex, nullptr, y, w_, u, w_ / 2, v, w_ / 2);
+    return true;
 }
 
 SDL_Texture* VideoDecoder::uploadIfDirty(SDL_Renderer* renderer)
@@ -89,6 +114,8 @@ SDL_Texture* VideoDecoder::uploadIfDirty(SDL_Renderer* renderer)
         tex_ = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV,
                                  SDL_TEXTUREACCESS_STREAMING, w_, h_);
         if (!tex_) return nullptr;
+        /* 线性缩放:窗口尺寸和 720p 不完全一致,最近邻会明显发虚/锯齿 */
+        SDL_SetTextureScaleMode(tex_, SDL_ScaleModeLinear);
     }
 
     const uint8_t* y = yuv_.data();

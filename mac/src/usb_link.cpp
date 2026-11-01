@@ -26,7 +26,9 @@ bool UsbLink::open()
 
     dev_ = libusb_open_device_with_vid_pid(ctx_, SWLINK_USB_VID, SWLINK_USB_PID);
     if (!dev_) {
-        snprintf(err_, sizeof(err_), "未找到设备 %04X:%04X", SWLINK_USB_VID, SWLINK_USB_PID);
+        snprintf(err_, sizeof(err_),
+                 "未找到 Switch 设备 %04X:%04X(检查 USB 线是否为数据线,以及 sysmodule 是否已启动)",
+                 SWLINK_USB_VID, SWLINK_USB_PID);
         close();
         return false;
     }
@@ -122,9 +124,27 @@ bool UsbLink::streamRead(void* data, int len, unsigned timeoutMs)
     return readExact(epStreamIn_, data, len, timeoutMs);
 }
 
+int UsbLink::streamReadSome(void* data, int maxLen, unsigned timeoutMs)
+{
+    int got = 0;
+    int rc = libusb_bulk_transfer(dev_, epStreamIn_, (uint8_t*)data, maxLen, &got, timeoutMs);
+    if (rc != 0 && rc != LIBUSB_ERROR_TIMEOUT)
+        return -1;
+    return got;
+}
+
 bool UsbLink::fileRead(void* data, int len, unsigned timeoutMs)
 {
     return readExact(epFileIn_, data, len, timeoutMs);
+}
+
+int UsbLink::fileReadSome(void* data, int maxLen, unsigned timeoutMs)
+{
+    int got = 0;
+    int rc = libusb_bulk_transfer(dev_, epFileIn_, (uint8_t*)data, maxLen, &got, timeoutMs);
+    if (rc != 0 && rc != LIBUSB_ERROR_TIMEOUT)
+        return -1;
+    return got;
 }
 
 bool UsbLink::fileWrite(const void* data, int len, unsigned timeoutMs)

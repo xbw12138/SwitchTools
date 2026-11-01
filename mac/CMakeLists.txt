@@ -59,3 +59,23 @@ target_link_libraries(swlink PRIVATE
     ${AVCODEC_LIBRARIES}
     ${AVUTIL_LIBRARIES}
 )
+
+# ---- 打包成可直接双击的 SwLink.app ----
+set_target_properties(swlink PROPERTIES
+    OUTPUT_NAME "SwLink"
+    MACOSX_BUNDLE TRUE
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/macos/Info.plist"
+    MACOSX_BUNDLE_BUNDLE_NAME "SwLink"
+    MACOSX_BUNDLE_BUNDLE_VERSION "0.2.0"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "0.2.0"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "com.swlink.client"
+)
+
+# 链接后自动把 SDK 依赖拷进 App、加图标并签名
+add_custom_command(TARGET swlink POST_BUILD
+    COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/bundle_app.sh"
+            "$<TARGET_BUNDLE_DIR:swlink>" "$<TARGET_FILE:swlink>"
+            "${CMAKE_SOURCE_DIR}/macos/AppIcon.icns"
+    COMMENT "打包 SwLink.app(内置依赖库 + 图标)"
+    VERBATIM
+)

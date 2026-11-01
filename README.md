@@ -16,6 +16,8 @@ USB 连接 Switch(大气层 Atmosphere)与 macOS,实现 **游戏画面+音频串
 - **接口 1(文件)**:40B 请求/响应头 + payload,8 条命令(PING/LIST/STAT/READ/WRITE/MKDIR/DELETE/RENAME)
 - 协议契约见 [protocol/swlink_protocol.h](protocol/swlink_protocol.h),USB VID:PID = `16C0:27DA`
 
+> 只想用、不想看代码?直接看 **[分步使用教程](docs/使用教程.md)**(含"一次成功"检查清单和按现象排错表)。
+
 ## 一、Switch 端(sysmodule)构建与安装
 
 需要 devkitPro + libnx:
@@ -45,8 +47,11 @@ cd switch && make
 
 ```sh
 cd mac && ./setup.sh     # 装 brew 依赖(cmake/sdl2/libusb/pkg-config) + 编译内置精简 ffmpeg
-./build/swlink
+open build/SwLink.app    # 双击 App 即可运行,无需命令行
 ```
+
+> 构建产物是自包含的 `mac/build/SwLink.app`(依赖库与图标已打进包内,已做本地临时签名)。
+> 首次打开若被系统拦截,右键 → 打开即可。
 
 > ffmpeg 不通过 Homebrew 安装:旧版 macOS(如 12)上 brew 没有预编译包,源码编译还会
 > 连带 Python 等重型依赖。`setup.sh` 会自行下载 ffmpeg 7.1 并只编译 h264 解码器,
@@ -56,8 +61,12 @@ cd mac && ./setup.sh     # 装 brew 依赖(cmake/sdl2/libusb/pkg-config) + 编�
 ## 三、使用
 
 1. Switch 开机(确保 SwLink sysmodule 已启动),USB 线连 Mac
-2. 打开 swlink 客户端,「串流」页签点 **连接 Switch**
-3. 进游戏即出画面和声音;「文件」页签可浏览 SD 卡、上传/下载/删除/新建/重命名
+2. 打开 SwLink.app,「串流画面」页点右上角 **连接 Switch**
+3. 进游戏即出画面和声音;「独立窗口」可把纯画面弹到单独窗口(可缩放到副屏/外接屏),
+   打开后主窗口停止渲染画面
+4. 「SD 卡文件」页可浏览 SD 卡、多选/递归下载、上传(支持整目录拖入)、新建/重命名/批量删除;
+   点表头排序,传输中显示速度、剩余时间并可取消,底部显示 SD 剩余容量
+5. 把本地文件或文件夹直接拖进窗口,即可上传到当前目录
 
 ## 四、限制与注意事项
 
@@ -72,17 +81,20 @@ cd mac && ./setup.sh     # 装 brew 依赖(cmake/sdl2/libusb/pkg-config) + 编�
 ```
 protocol/swlink_protocol.h   两端唯一协议契约
 switch/                      sysmodule(devkitPro 工程)
-  source/usb_comms.c         usb:ds 双接口初始化与端点读写
+  source/usb_link.c          usb:ds 双接口初始化与端点读写
   source/capture.c           grc:d 采集(H.264+PCM,SPS/PPS 注入)
   source/stream_server.c     握手 + 流发送(视频 main 线程,音频独立线程)
   source/file_server.c       SD 卡文件服务(原生 fs IPC,无堆)
-  source/main.c              入口,禁堆,线程拉起
+  source/main.c              入口,256KB 静态堆,拉起各线程
   Makefile / swlink.json     构建配置(title id 00FF0000A53B5A57)
 mac/                         macOS 客户端(CMake 工程)
   src/usb_link.cpp           libusb 连接/握手/端点读写
   src/stream_client.cpp      流拆包线程
   src/video_decoder.cpp      FFmpeg H.264 解码 -> SDL YUV 纹理
-  src/audio_output.cpp       SDL 音频队列(积压 0.5s 丢旧)
+  src/audio_output.cpp       SDL 音频队列(积压 0.5s 丢旧,支持静音)
   src/file_client.cpp        文件传输协议客户端
-  src/main.cpp               ImGui 界面(串流/文件两页签)
+  src/main.cpp               ImGui 界面(串流/文件/帮助 三页)
+  macos/Info.plist           App 包元信息
+  macos/AppIcon.icns         应用图标
+  scripts/bundle_app.sh      把依赖库打进 .app 并做本地签名
 ```
