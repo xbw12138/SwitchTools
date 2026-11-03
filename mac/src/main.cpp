@@ -34,7 +34,6 @@
 #include "video_decoder.hpp"
 #include "audio_output.hpp"
 #include "file_client.hpp"
-#include "nxlink_client.hpp"
 #include "../../protocol/swlink_protocol.h"
 
 /* ---------------- 配色 ---------------- */
@@ -59,9 +58,6 @@ static VideoDecoder g_decoder;
 static AudioOutput g_audio;
 static FileClient* g_files = nullptr;
 
-/* nxlink 推送用的 Switch IP(自动记住) */
-static char g_switchIp[64] = "";
-
 static ImFont* g_fontTitle = nullptr;
 static float g_pixelScale = 1.0f;
 
@@ -72,13 +68,14 @@ static std::string g_status = "未连接";
 static std::mutex g_errMutex;
 static std::string g_errorText;
 
-/* nxlink:向 hbmenu 推送 NRO 并接收程序输出 */
-static NxlinkHost g_nxlink;
+/* NRO 推送:本地 .nro 经 USB 文件通道写入 Switch 的 SD 卡 */
 static char g_nxNroPath[512] = "";
 static char g_nxSdPath[256] = "switch/";
 static std::atomic<bool> g_nxBusy{false};
+static std::atomic<int> g_nxPercent{0};
 static std::mutex g_nxStatusMutex;
 static std::string g_nxStatus;
+static std::string g_nxLog;
 
 static void setNxStatus(const std::string& s)
 {
@@ -92,6 +89,19 @@ static std::string nxStatus()
     return g_nxStatus;
 }
 
+static void appendNxLog(const std::string& s)
+{
+    std::lock_guard<std::mutex> lk(g_nxStatusMutex);
+    if (!g_nxLog.empty()) g_nxLog += '\n';
+    g_nxLog += s;
+}
+
+static std::string nxLog()
+{
+    std::lock_guard<std::mutex> lk(g_nxStatusMutex);
+    return g_nxLog;
+}
+
 static SDL_Window* g_window = nullptr;
 /* 独立串流窗口(可拖到副屏/单独放大) */
 static SDL_Window* g_vwin = nullptr;
@@ -99,7 +109,7 @@ static SDL_Renderer* g_vrend = nullptr;
 static SDL_Texture* g_vtex = nullptr;
 static uint64_t g_vframe = 0;
 static int g_vtexW = 0, g_vtexH = 0;
-static int g_page = 0;          /* 0 = 串流, 1 = 文件, 2 = nxlink, 3 = 帮助 */
+static int g_page = 0;          /* 0 = 串流, 1 = 文件, 2 = NRO 推送, 3 = 帮助 */
 static bool g_muted = false;
 static float g_fps = 0.0f;
 
@@ -257,45 +267,6 @@ static std::string ftStatus()
 {
     std::lock_guard<std::mutex> lk(g_ftMutex);
     return g_ftStatus;
-}
-
-/* ---------------- 设置 ---------------- */
-
-static std::string settingsPath()
-{
-    const char* home = getenv("HOME");
-    if (!home) return std::string();
-    return std::string(home) + "/.swlink.conf";
-}
-
-/* 记住上次填写的 Switch IP(nxlink 推送用),省得每次重输 */
-static void loadSettings()
-{
-    FILE* f = fopen(settingsPath().c_str(), "r");
-    if (!f) return;
-
-    char line[128];
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "ip=", 3) != 0)
-            continue;
-        std::string ip(line + 3);
-        while (!ip.empty() && (ip.back() == '\n' || ip.back() == '\r'))
-            ip.pop_back();
-        if (!ip.empty() && ip.size() < sizeof(g_switchIp))
-            snprintf(g_switchIp, sizeof(g_switchIp), "%s", ip.c_str());
-    }
-    fclose(f);
-}
-
-static void saveSettings()
-{
-    const std::string path = settingsPath();
-    if (path.empty()) return;
-
-    FILE* f = fopen(path.c_str(), "w");
-    if (!f) return;
-    fprintf(f, "ip=%s\n", g_switchIp);
-    fclose(f);
 }
 
 /* ---------------- 连接管理 ---------------- */
@@ -566,7 +537,7 @@ static void drawTopBar()
     dl->AddText(stPos, g_connected ? COL_TEXT_DIM
                                    : (err.empty() ? COL_TEXT_FAINT : COL_ERR), st);
 
-    ImGui::BeginDisabled(g_ftBusy);
+    ImGui::BeginDisabled(g_ftBusy || g_nxBusy.load());
     ImGui::SetCursorScreenPos(btnPos);
     if (g_connected) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.24f, 0.28f, 1.0f));
@@ -627,7 +598,7 @@ static void drawSidebar()
     ImGui::BeginGroup();
     navItem("串流画面", 0);
     navItem("SD 卡文件", 1);
-    navItem("nxlink 推送", 2);
+    navItem("NRO 推送", 2);
     navItem("使用帮助", 3);
     ImGui::EndGroup();
 
@@ -1541,7 +1512,7 @@ static void helpRow(const char* title, const char* body)
     ImGui::PopStyleColor();
 }
 
-/* ---------------- nxlink 页 ---------------- */
+/* ---------------- NRO 推送页 ---------------- */
 
 static bool endsWithNro(const std::string& s)
 {
@@ -1553,8 +1524,8 @@ static void startNxlinkPush()
     if (g_nxBusy.load())
         return;
 
-    if (g_switchIp[0] == '\0') {
-        setNxStatus("请先填写 Switch 的 IP 地址");
+    if (!g_connected || !g_files) {
+        setNxStatus("请先连接 Switch(USB)");
         return;
     }
     if (g_nxNroPath[0] == '\0') {
@@ -1566,25 +1537,39 @@ static void startNxlinkPush()
         return;
     }
 
-    const std::string ip = g_switchIp;
     const std::string nro = g_nxNroPath;
     const std::string sd = g_nxSdPath;
 
     g_nxBusy = true;
+    g_nxPercent = 0;
     setNxStatus("正在上传...");
+    appendNxLog("推送 " + nro + " -> SD:" + sd);
 
-    std::thread([ip, nro, sd]() {
-        std::string err;
-        /* 先开始监听,被拉起的程序会连回本机 28280 */
-        if (!g_nxlink.startStdio(28280, &err)) {
-            setNxStatus("输出服务启动失败: " + err);
+    std::thread([nro, sd]() {
+        FileClient* files = g_files;
+        if (!files) {
             g_nxBusy = false;
             return;
         }
-        if (!g_nxlink.upload(ip, 28280, nro, sd, &err))
+
+        /* hbmenu 只列 switch 目录,目录不存在就先建一个 */
+        if (sd.rfind("switch/", 0) == 0)
+            files->mkdir("switch");
+
+        const bool ok = files->writeFile(nro, sd, [](uint64_t done, uint64_t total) {
+            if (total > 0)
+                g_nxPercent = (int)(done * 100 / total);
+        });
+
+        if (ok) {
+            setNxStatus("已写入 SD 卡");
+            appendNxLog("完成:SD:" + sd);
+            appendNxLog("在 Switch 上按住 R 启动 hbmenu,进入 switch 目录点选该文件即可运行");
+        } else {
+            const std::string err = files->lastError();
             setNxStatus("推送失败: " + err);
-        else
-            setNxStatus("已推送,等待程序输出...");
+            appendNxLog("失败: " + err);
+        }
         g_nxBusy = false;
     }).detach();
 }
@@ -1592,14 +1577,14 @@ static void startNxlinkPush()
 static void drawNxlinkPage()
 {
     ImGui::PushFont(g_fontTitle);
-    ImGui::TextUnformatted("nxlink 推送");
+    ImGui::TextUnformatted("NRO 推送(USB)");
     ImGui::PopFont();
 
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_TEXT_DIM));
     ImGui::TextWrapped(
-        "把本地 .nro 推送到 Switch 并在内存中运行,同时把程序的 printf 输出显示在下面。"
-        "使用前请在 Switch 上启动 hbmenu(按住 R 键启动进入全内存模式),它会在 28280 端口等待接收。");
+        "通过 USB 把本地 .nro 直接写入 Switch 的 SD 卡,不需要网络。"
+        "写入后到 Switch 上启动 hbmenu(按住 R 键进入全内存模式),在 switch 目录里点选它即可运行。");
     ImGui::PopStyleColor();
 
     ImGui::Spacing();
@@ -1608,51 +1593,31 @@ static void drawNxlinkPage()
 
     ImGui::BeginDisabled(g_nxBusy.load());
 
-    ImGui::SetNextItemWidth(180);
-    if (ImGui::InputTextWithHint("##nxip", "Switch IP", g_switchIp, sizeof(g_switchIp)))
-        saveSettings();
-    ImGui::SameLine();
-    ImGui::TextDisabled("Switch 地址");
-
     ImGui::SetNextItemWidth(520);
     ImGui::InputTextWithHint("##nxnro", "本地 .nro 文件路径(可拖拽文件到窗口)",
                              g_nxNroPath, sizeof(g_nxNroPath));
 
     ImGui::SetNextItemWidth(520);
-    ImGui::InputTextWithHint("##nxdest", "Switch 上的保存路径,如 switch/xxx.nro",
+    ImGui::InputTextWithHint("##nxdest", "Switch SD 卡上的保存路径,如 switch/xxx.nro",
                              g_nxSdPath, sizeof(g_nxSdPath));
 
     ImGui::Spacing();
-    if (ImGui::Button(g_nxBusy.load() ? "上传中..." : "推送并运行", ImVec2(120, 34)))
+    if (ImGui::Button(g_nxBusy.load() ? "上传中..." : "推送到 SD 卡", ImVec2(140, 34)))
         startNxlinkPush();
     ImGui::SameLine();
-    if (ImGui::Button("清空日志", ImVec2(96, 34)))
-        g_nxlink.clearLog();
+    if (ImGui::Button("清空记录", ImVec2(96, 34))) {
+        std::lock_guard<std::mutex> lk(g_nxStatusMutex);
+        g_nxLog.clear();
+    }
 
     ImGui::EndDisabled();
 
     ImGui::SameLine();
-    if (g_nxlink.stdioListening()) {
-        if (ImGui::Button("停止监听", ImVec2(96, 34))) {
-            g_nxlink.stopStdio();
-            setNxStatus("已停止监听");
-        }
-    } else {
-        ImGui::BeginDisabled(true);
-        ImGui::Button("未监听", ImVec2(96, 34));
-        ImGui::EndDisabled();
-    }
-
-    ImGui::SameLine();
     const std::string status = nxStatus();
-    const bool connected = g_nxlink.stdioConnected();
-    ImGui::TextColored(connected ? ImGui::ColorConvertU32ToFloat4(COL_OK)
-                                 : ImGui::ColorConvertU32ToFloat4(COL_TEXT_DIM),
-                       "%s", connected ? "输出已连接" : "");
-    if (!status.empty()) {
-        ImGui::SameLine();
+    if (g_nxBusy.load())
+        ImGui::TextDisabled("%s %d%%", status.c_str(), g_nxPercent.load());
+    else if (!status.empty())
         ImGui::TextDisabled("%s", status.c_str());
-    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1664,9 +1629,9 @@ static void drawNxlinkPage()
                       ImGuiWindowFlags_HorizontalScrollbar);
 
     const bool atBottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f;
-    const std::string log = g_nxlink.logSnapshot();
+    const std::string log = nxLog();
     if (log.empty())
-        ImGui::TextDisabled("程序输出会显示在这里");
+        ImGui::TextDisabled("推送记录会显示在这里");
     else
         ImGui::TextUnformatted(log.c_str());
     if (atBottom)
@@ -1746,7 +1711,6 @@ int main(int, char**)
     ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer2_Init(renderer);
     loadFonts();
-    loadSettings();
 
     bool running = true;
     std::vector<std::string> dropped;          /* 拖入的文件,下一帧上传 */
@@ -1787,7 +1751,7 @@ int main(int, char**)
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        /* 拖入的文件:nxlink 页作为待推送 NRO,其它页上传到文件页当前目录 */
+        /* 拖入的文件:NRO 页作为待推送文件,其它页上传到文件页当前目录 */
         if (!dropped.empty()) {
             if (g_page == 2) {
                 const std::string& p = dropped.front();
@@ -1797,7 +1761,7 @@ int main(int, char**)
                     base = base ? base + 1 : p.c_str();
                     snprintf(g_nxSdPath, sizeof(g_nxSdPath), "switch/%s", base);
                 }
-                setNxStatus("已选择文件,点\"推送并运行\"");
+                setNxStatus("已选择文件,点\"推送到 SD 卡\"");
             } else if (!g_files) {
                 setError("请先连接 Switch,再拖入文件上传");
             } else if (g_ftBusy) {

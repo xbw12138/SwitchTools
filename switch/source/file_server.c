@@ -18,7 +18,7 @@ typedef struct {
     FsFileSystem* sd;
 } FileSession;
 
-static alignas(0x1000) u8 g_buf[sizeof(SwlinkFtHeader) + SWLINK_FT_CHUNK];
+static alignas(0x1000) u8 g_buf[sizeof(SwlinkFtHeader) + SWLINK_FT_CHUNK + SWLINK_FT_PATH_MAX + 2];
 static FsFileSystem g_sd;
 
 void fileServerInit(FsFileSystem* sd)
@@ -271,7 +271,9 @@ static bool handleOne(FileSession* s)
     resp.offset = 0;
     resp.size = 0;
 
-    if (req.magic != SWLINK_FT_MAGIC || req.payload_len > SWLINK_FT_CHUNK) {
+    /* 负载可含路径前缀,故上限放宽到 CHUNK + 路径长度 */
+    if (req.magic != SWLINK_FT_MAGIC ||
+        req.payload_len > SWLINK_FT_CHUNK + SWLINK_FT_PATH_MAX + 2) {
         resp.status = SWLINK_FT_ERR_BAD_REQUEST;
         respond(s, &resp, NULL, 0);
         return true;

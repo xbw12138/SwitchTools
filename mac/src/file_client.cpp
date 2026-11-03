@@ -211,6 +211,16 @@ bool FileClient::writeFile(const std::string& local, const std::string& remote, 
 
     uint64_t done = 0;
     bool ok = true;
+
+    /* 请求负载 = 路径 + 数据,设备端限制整个 payload 不超过 SWLINK_FT_CHUNK */
+    const std::vector<uint8_t> pathPayload = packPath(remote);
+    if (pathPayload.size() >= SWLINK_FT_CHUNK) {
+        err_ = "目标路径过长";
+        fclose(f);
+        return false;
+    }
+    const uint64_t chunkMax = SWLINK_FT_CHUNK - pathPayload.size();
+
     while (done < total) {
         if (cancelled()) {
             err_ = "已取消";
@@ -218,10 +228,10 @@ bool FileClient::writeFile(const std::string& local, const std::string& remote, 
             break;
         }
         uint64_t want = total - done;
-        if (want > SWLINK_FT_CHUNK) want = SWLINK_FT_CHUNK;
+        if (want > chunkMax) want = chunkMax;
 
         /* payload = [u16 len][path][data...] */
-        std::vector<uint8_t> payload = packPath(remote);
+        std::vector<uint8_t> payload = pathPayload;
         size_t pathBytes = payload.size();
         payload.resize(pathBytes + want);
         if (fread(payload.data() + pathBytes, 1, want, f) != want) {
