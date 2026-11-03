@@ -2,7 +2,7 @@
  * file_client.cpp
  */
 #include "file_client.hpp"
-#include "usb_link.hpp"
+#include "link.hpp"
 #include "../../protocol/swlink_protocol.h"
 
 #include <cstring>

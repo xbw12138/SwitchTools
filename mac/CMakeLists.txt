@@ -29,6 +29,7 @@ add_executable(swlink
     src/video_decoder.cpp
     src/audio_output.cpp
     src/file_client.cpp
+    src/nxlink_client.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -58,6 +59,7 @@ target_link_libraries(swlink PRIVATE
     ${LIBUSB_LIBRARIES}
     ${AVCODEC_LIBRARIES}
     ${AVUTIL_LIBRARIES}
+    z
 )
 
 # ---- 打包成可直接双击的 SwLink.app ----

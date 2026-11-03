@@ -2,7 +2,7 @@
  * stream_client.cpp
  */
 #include "stream_client.hpp"
-#include "usb_link.hpp"
+#include "link.hpp"
 #include "../../protocol/swlink_protocol.h"
 
 #include <vector>

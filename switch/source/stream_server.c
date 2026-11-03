@@ -1,8 +1,9 @@
 /*
  * stream_server.c
- * 串流服务实现:HELLO 握手,视频/音频复用同一 IN 端点
+ * 串流服务实现:USB 握手,视频/音频复用同一通道
  */
 #include <string.h>
+
 #include "stream_server.h"
 #include "capture.h"
 #include "usb_link.h"
@@ -18,12 +19,12 @@ static void logWriteFail(size_t written, size_t expected)
     static int n = 0;
     if (n++ >= 5)
         return;
-    sdLogRc("USB 写入 实际/期望", (Result)((written << 16) | (expected & 0xFFFF)));
+    sdLogRc("写入 实际/期望", (Result)((written << 16) | (expected & 0xFFFF)));
 }
 
 #define HANDSHAKE_TIMEOUT 1E+9  /* 1s */
-/* 100ms 足够传完最大视频包;设太小会误丢帧,设成 1s 一旦主机暂时没读就会卡顿整秒 */
-#define SEND_TIMEOUT      1E+8
+/* USB:100ms 足够传完最大视频包;设太小会误丢帧,设成 1s 一旦主机暂时没读就会卡顿整秒 */
+#define SEND_TIMEOUT_USB  1E+8
 
 static bool videoConnected = false;
 static bool audioConnected = false;
@@ -34,13 +35,7 @@ static bool clientConnected(void)
     return videoConnected || audioConnected;
 }
 
-static void disconnectClient(void)
-{
-    videoConnected = false;
-    audioConnected = false;
-}
-
-/* 视频/音频线程共用的发送入口,互斥保护 IN 端点 */
+/* 视频/音频线程共用的发送入口,互斥保护通道 */
 static bool sendPacket(const void* data, size_t length)
 {
     bool success;
@@ -49,7 +44,7 @@ static bool sendPacket(const void* data, size_t length)
     if (!clientConnected()) {
         success = false;
     } else {
-        size_t written = swlinkUsbWrite(USB_INTF_STREAM, data, length, SEND_TIMEOUT);
+        size_t written = swlinkUsbWrite(USB_INTF_STREAM, data, length, SEND_TIMEOUT_USB);
         if (written != length)
             logWriteFail(written, length);
         success = written == length;
@@ -59,20 +54,28 @@ static bool sendPacket(const void* data, size_t length)
     return success;
 }
 
-/* 阻塞式握手:发 HELLO -> 收请求 -> 校验 -> 回响应 */
-static bool connectClient(void)
+static void disconnectClient(void)
 {
-    size_t num = 0;
+    mutexLock(&sendMutex);
+    videoConnected = false;
+    audioConnected = false;
+    mutexUnlock(&sendMutex);
+}
 
-    /* 循环发 HELLO 直到主机收到 */
-    do
+/* 握手:循环发 HELLO 直到主机读到(主机可能刚插线还没开始读),
+   然后只读一次请求。重复发 HELLO 会污染响应流,这里只发成功一次。 */
+static bool handshake(void)
+{
+    SwlinkHandshakeRequest req;
+
+    size_t num = 0;
+    do {
         num = swlinkUsbWrite(USB_INTF_STREAM, SWLINK_HELLO, sizeof(SWLINK_HELLO), HANDSHAKE_TIMEOUT);
-    while (num == 0 && g_streamRunning);
+    } while (num == 0 && g_streamRunning);
 
     if (num != sizeof(SWLINK_HELLO) || !g_streamRunning)
         return false;
 
-    SwlinkHandshakeRequest req;
     if (swlinkUsbRead(USB_INTF_STREAM, &req, sizeof(req), HANDSHAKE_TIMEOUT) != sizeof(req))
         return false;
 
@@ -111,6 +114,18 @@ static bool connectClient(void)
     return true;
 }
 
+/* 握手建立连接 */
+static bool connectClient(void)
+{
+    bool ok;
+
+    mutexLock(&sendMutex);
+    ok = handshake();
+    mutexUnlock(&sendMutex);
+
+    return ok;
+}
+
 void streamVideoThread(void* arg)
 {
     (void)arg;
@@ -121,6 +136,12 @@ void streamVideoThread(void* arg)
         if (!clientConnected()) {
             /* 视频线程作为主线程负责握手 */
             if (!connectClient()) {
+                /* 心跳:约每 20 秒报一次,确认设备还在轮询等待客户端 */
+                static int waitBeats = 0;
+                if (++waitBeats >= 8) {
+                    waitBeats = 0;
+                    sdLog("等待客户端连接中 (USB)...");
+                }
                 svcSleepThread(5E+8L);
                 continue;
             }

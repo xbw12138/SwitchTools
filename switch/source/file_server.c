@@ -1,15 +1,23 @@
 /*
  * file_server.c
- * SD 卡文件传输服务实现 (原生 fs IPC,不经过 fsdev,无堆分配)
+ * SD 卡文件传输服务:处理 USB 文件接口上的请求
+ * (原生 fs IPC,不经过 fsdev,无堆分配)
  */
 #include <string.h>
+
 #include "file_server.h"
 #include "usb_link.h"
 #include "../../protocol/swlink_protocol.h"
 
-#define USB_TIMEOUT 3E+9
+#define FT_TIMEOUT 3E+9
+/* 读请求时每 0.5s 醒一次,给退出标志和断线检测留出机会 */
+#define FT_SLICE   5E+8
 
-/* 头 + 最大 payload 的静态收发缓冲,单次写回保证原子性 */
+typedef struct {
+    u8* buf;              /* sizeof(SwlinkFtHeader) + SWLINK_FT_CHUNK */
+    FsFileSystem* sd;
+} FileSession;
+
 static alignas(0x1000) u8 g_buf[sizeof(SwlinkFtHeader) + SWLINK_FT_CHUNK];
 static FsFileSystem g_sd;
 
@@ -45,25 +53,49 @@ static u32 parsePath(const u8* payload, u32 payload_len, char* out, u32 out_size
     return SWLINK_FT_OK;
 }
 
-static size_t respond(SwlinkFtHeader* resp, const void* payload, u32 payload_len)
+static size_t respond(FileSession* s, SwlinkFtHeader* resp, const void* payload, u32 payload_len)
 {
     size_t total = sizeof(SwlinkFtHeader) + payload_len;
     resp->payload_len = payload_len;
-    memcpy(g_buf, resp, sizeof(SwlinkFtHeader));
-    /* 处理函数可能已直接在 g_buf payload 区构建数据,避免同地址拷贝 */
-    if (payload_len && (const u8*)payload != g_buf + sizeof(SwlinkFtHeader))
-        memcpy(g_buf + sizeof(SwlinkFtHeader), payload, payload_len);
-    return swlinkUsbWrite(USB_INTF_FILE, g_buf, total, USB_TIMEOUT) == total ? total : 0;
+    memcpy(s->buf, resp, sizeof(SwlinkFtHeader));
+    /* 处理函数可能已直接在 buf payload 区构建数据,避免同地址拷贝 */
+    if (payload_len && (const u8*)payload != s->buf + sizeof(SwlinkFtHeader))
+        memcpy(s->buf + sizeof(SwlinkFtHeader), payload, payload_len);
+    return swlinkUsbWrite(USB_INTF_FILE, s->buf, total, FT_TIMEOUT) == total ? total : 0;
+}
+
+/* 收满 size 字节;false = 断开或已停止运行 */
+static bool readFull(FileSession* s, void* dst, u32 size)
+{
+    u8* p = (u8*)dst;
+    u32 got = 0;
+    int idleSlices = 0;
+
+    while (got < size) {
+        if (!g_fileRunning)
+            return false;
+
+        size_t n = swlinkUsbRead(USB_INTF_FILE, p + got, size - got, FT_SLICE);
+        if (n == 0) {
+            /* 半截请求停滞 3 秒(USB 拔插):丢弃并重新同步 */
+            if (got > 0 && ++idleSlices >= 6)
+                return false;
+            continue;
+        }
+        idleSlices = 0;
+        got += (u32)n;
+    }
+    return true;
 }
 
 /* LIST: 请求 offset 为起始条目索引;响应 offset 为下一索引(0 表示读完) */
-static u32 handleList(SwlinkFtHeader* resp, const char* path, u64 startIndex)
+static u32 handleList(FileSession* s, SwlinkFtHeader* resp, const char* path, u64 startIndex)
 {
     FsDir dir;
-    Result rc = fsFsOpenDirectory(&g_sd, path, FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles, &dir);
+    Result rc = fsFsOpenDirectory(s->sd, path, FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles, &dir);
     if (R_FAILED(rc)) return mapError(rc);
 
-    u8* out = g_buf + sizeof(SwlinkFtHeader);
+    u8* out = s->buf + sizeof(SwlinkFtHeader);
     u8* w = out;
     u64 index = 0;
     u32 count = 0;
@@ -102,13 +134,13 @@ static u32 handleList(SwlinkFtHeader* resp, const char* path, u64 startIndex)
     resp->offset = more ? (startIndex + count) : 0;
     resp->size = count;
 
-    return respond(resp, out, (u32)(w - out)) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
+    return respond(s, resp, out, (u32)(w - out)) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
 }
 
-static u32 handleStat(SwlinkFtHeader* resp, const char* path)
+static u32 handleStat(FileSession* s, SwlinkFtHeader* resp, const char* path)
 {
     FsDirEntryType type;
-    Result rc = fsFsGetEntryType(&g_sd, path, &type);
+    Result rc = fsFsGetEntryType(s->sd, path, &type);
     if (R_FAILED(rc)) return mapError(rc);
 
     struct { u8 type; u64 size; } st;
@@ -117,7 +149,7 @@ static u32 handleStat(SwlinkFtHeader* resp, const char* path)
 
     if (st.type == 2) {
         FsFile f;
-        rc = fsFsOpenFile(&g_sd, path, FsOpenMode_Read, &f);
+        rc = fsFsOpenFile(s->sd, path, FsOpenMode_Read, &f);
         if (R_FAILED(rc)) return mapError(rc);
         s64 sz = 0;
         fsFileGetSize(&f, &sz);
@@ -125,19 +157,18 @@ static u32 handleStat(SwlinkFtHeader* resp, const char* path)
         st.size = (u64)sz;
     }
 
-    memcpy(g_buf + sizeof(SwlinkFtHeader), &st, sizeof(st));
-    return respond(resp, &st, sizeof(st)) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
+    return respond(s, resp, &st, sizeof(st)) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
 }
 
-static u32 handleRead(SwlinkFtHeader* resp, const char* path, u64 offset, u64 size)
+static u32 handleRead(FileSession* s, SwlinkFtHeader* resp, const char* path, u64 offset, u64 size)
 {
     if (size > SWLINK_FT_CHUNK) size = SWLINK_FT_CHUNK;
 
     FsFile f;
-    Result rc = fsFsOpenFile(&g_sd, path, FsOpenMode_Read, &f);
+    Result rc = fsFsOpenFile(s->sd, path, FsOpenMode_Read, &f);
     if (R_FAILED(rc)) return mapError(rc);
 
-    u8* out = g_buf + sizeof(SwlinkFtHeader);
+    u8* out = s->buf + sizeof(SwlinkFtHeader);
     u64 done = 0;
     rc = fsFileRead(&f, offset, out, size, FsReadOption_None, &done);
     fsFileClose(&f);
@@ -145,20 +176,20 @@ static u32 handleRead(SwlinkFtHeader* resp, const char* path, u64 offset, u64 si
     if (R_FAILED(rc)) return mapError(rc);
 
     resp->size = done;
-    return respond(resp, out, (u32)done) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
+    return respond(s, resp, out, (u32)done) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
 }
 
 /* WRITE: 每块 open(不存在则创建)+ SetSize(offset+len) + write + flush + close */
-static u32 handleWrite(SwlinkFtHeader* resp, const char* path, u64 offset, u64 size, const u8* data)
+static u32 handleWrite(FileSession* s, SwlinkFtHeader* resp, const char* path, u64 offset, u64 size, const u8* data)
 {
     if (size > SWLINK_FT_CHUNK) return SWLINK_FT_ERR_BAD_REQUEST;
 
     FsFile f;
-    Result rc = fsFsOpenFile(&g_sd, path, FsOpenMode_Write | FsOpenMode_Append, &f);
+    Result rc = fsFsOpenFile(s->sd, path, FsOpenMode_Write | FsOpenMode_Append, &f);
     if (R_FAILED(rc)) {
-        rc = fsFsCreateFile(&g_sd, path, offset + size, 0);
+        rc = fsFsCreateFile(s->sd, path, offset + size, 0);
         if (R_FAILED(rc)) return mapError(rc);
-        rc = fsFsOpenFile(&g_sd, path, FsOpenMode_Write, &f);
+        rc = fsFsOpenFile(s->sd, path, FsOpenMode_Write, &f);
         if (R_FAILED(rc)) return mapError(rc);
     }
 
@@ -169,40 +200,40 @@ static u32 handleWrite(SwlinkFtHeader* resp, const char* path, u64 offset, u64 s
 
     if (R_FAILED(rc)) return mapError(rc);
     resp->size = size;
-    return respond(resp, NULL, 0) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
+    return respond(s, resp, NULL, 0) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
 }
 
-static u32 handleStatFs(SwlinkFtHeader* resp, const char* path)
+static u32 handleStatFs(FileSession* s, SwlinkFtHeader* resp, const char* path)
 {
     s64 total = 0, freeSpace = 0;
-    Result rc = fsFsGetTotalSpace(&g_sd, path, &total);
+    Result rc = fsFsGetTotalSpace(s->sd, path, &total);
     if (R_FAILED(rc)) return mapError(rc);
 
-    rc = fsFsGetFreeSpace(&g_sd, path, &freeSpace);
+    rc = fsFsGetFreeSpace(s->sd, path, &freeSpace);
     if (R_FAILED(rc)) return mapError(rc);
 
     struct { u64 total; u64 free; } st = { (u64)total, (u64)freeSpace };
-    return respond(resp, &st, sizeof(st)) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
+    return respond(s, resp, &st, sizeof(st)) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
 }
 
-static u32 handleMkdir(SwlinkFtHeader* resp, const char* path)
+static u32 handleMkdir(FileSession* s, SwlinkFtHeader* resp, const char* path)
 {
-    Result rc = fsFsCreateDirectory(&g_sd, path);
+    Result rc = fsFsCreateDirectory(s->sd, path);
     /* 已存在视为成功,幂等 */
     if (R_FAILED(rc) && rc != 0x402)
         return mapError(rc);
-    return respond(resp, NULL, 0) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
+    return respond(s, resp, NULL, 0) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
 }
 
-static u32 handleDelete(SwlinkFtHeader* resp, const char* path, bool isDir)
+static u32 handleDelete(FileSession* s, SwlinkFtHeader* resp, const char* path, bool isDir)
 {
-    Result rc = isDir ? fsFsDeleteDirectoryRecursively(&g_sd, path)
-                      : fsFsDeleteFile(&g_sd, path);
+    Result rc = isDir ? fsFsDeleteDirectoryRecursively(s->sd, path)
+                      : fsFsDeleteFile(s->sd, path);
     if (R_FAILED(rc)) return mapError(rc);
-    return respond(resp, NULL, 0) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
+    return respond(s, resp, NULL, 0) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
 }
 
-static u32 handleRename(SwlinkFtHeader* resp, const u8* payload, u32 payload_len)
+static u32 handleRename(FileSession* s, SwlinkFtHeader* resp, const u8* payload, u32 payload_len)
 {
     char oldPath[SWLINK_FT_PATH_MAX + 1];
     char newPath[SWLINK_FT_PATH_MAX + 1];
@@ -216,100 +247,109 @@ static u32 handleRename(SwlinkFtHeader* resp, const u8* payload, u32 payload_len
     if (err != SWLINK_FT_OK) return err;
 
     FsDirEntryType type;
-    Result rc = fsFsGetEntryType(&g_sd, oldPath, &type);
+    Result rc = fsFsGetEntryType(s->sd, oldPath, &type);
     if (R_FAILED(rc)) return mapError(rc);
 
     rc = (type == FsDirEntryType_Dir)
-        ? fsFsRenameDirectory(&g_sd, oldPath, newPath)
-        : fsFsRenameFile(&g_sd, oldPath, newPath);
+        ? fsFsRenameDirectory(s->sd, oldPath, newPath)
+        : fsFsRenameFile(s->sd, oldPath, newPath);
     if (R_FAILED(rc)) return mapError(rc);
 
-    return respond(resp, NULL, 0) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
+    return respond(s, resp, NULL, 0) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
+}
+
+/* 处理一次完整请求;false = 通道断开/停止 */
+static bool handleOne(FileSession* s)
+{
+    SwlinkFtHeader req;
+
+    if (!readFull(s, &req, sizeof(req)))
+        return false;
+
+    SwlinkFtHeader resp = req;          /* magic/cmd/seq 回显 */
+    resp.status = SWLINK_FT_OK;
+    resp.offset = 0;
+    resp.size = 0;
+
+    if (req.magic != SWLINK_FT_MAGIC || req.payload_len > SWLINK_FT_CHUNK) {
+        resp.status = SWLINK_FT_ERR_BAD_REQUEST;
+        respond(s, &resp, NULL, 0);
+        return true;
+    }
+
+    u8* payload = s->buf + sizeof(SwlinkFtHeader);
+    if (req.payload_len && !readFull(s, payload, req.payload_len))
+        return false;
+
+    char path[SWLINK_FT_PATH_MAX + 1];
+    u32 err = SWLINK_FT_OK;
+
+    switch (req.cmd) {
+    case SwlinkFt_Ping: {
+        const char* ver = SWLINK_PROTO_VERSION;
+        respond(s, &resp, ver, sizeof(SWLINK_PROTO_VERSION));
+        break;
+    }
+    case SwlinkFt_List:
+        err = parsePath(payload, req.payload_len, path, sizeof(path), NULL);
+        if (err == SWLINK_FT_OK) err = handleList(s, &resp, path, req.offset);
+        break;
+    case SwlinkFt_Stat:
+        err = parsePath(payload, req.payload_len, path, sizeof(path), NULL);
+        if (err == SWLINK_FT_OK) err = handleStat(s, &resp, path);
+        break;
+    case SwlinkFt_Read:
+        err = parsePath(payload, req.payload_len, path, sizeof(path), NULL);
+        if (err == SWLINK_FT_OK) err = handleRead(s, &resp, path, req.offset, req.size);
+        break;
+    case SwlinkFt_Write: {
+        /* payload = [u16 len][path][data...] */
+        u32 consumed = 0;
+        err = parsePath(payload, req.payload_len, path, sizeof(path), &consumed);
+        if (err == SWLINK_FT_OK) {
+            if (consumed + req.size > req.payload_len)
+                err = SWLINK_FT_ERR_BAD_REQUEST;
+            else
+                err = handleWrite(s, &resp, path, req.offset, req.size, payload + consumed);
+        }
+        break;
+    }
+    case SwlinkFt_Mkdir:
+        err = parsePath(payload, req.payload_len, path, sizeof(path), NULL);
+        if (err == SWLINK_FT_OK) err = handleMkdir(s, &resp, path);
+        break;
+    case SwlinkFt_Delete:
+        err = parsePath(payload, req.payload_len, path, sizeof(path), NULL);
+        if (err == SWLINK_FT_OK) err = handleDelete(s, &resp, path, (req.offset & 1) != 0);
+        break;
+    case SwlinkFt_Rename:
+        err = handleRename(s, &resp, payload, req.payload_len);
+        break;
+    case SwlinkFt_StatFs:
+        err = parsePath(payload, req.payload_len, path, sizeof(path), NULL);
+        if (err == SWLINK_FT_OK) err = handleStatFs(s, &resp, path);
+        break;
+    default:
+        err = SWLINK_FT_ERR_BAD_REQUEST;
+        break;
+    }
+
+    /* 处理函数内部成功时已自行回响应;这里统一回错误 */
+    if (err != SWLINK_FT_OK) {
+        resp.status = err;
+        respond(s, &resp, NULL, 0);
+    }
+    return true;
 }
 
 void fileServerThread(void* arg)
 {
     (void)arg;
 
+    FileSession s = { .buf = g_buf, .sd = &g_sd };
+
     while (g_fileRunning) {
-        SwlinkFtHeader req;
-        size_t got = swlinkUsbRead(USB_INTF_FILE, &req, sizeof(req), USB_TIMEOUT);
-        if (got != sizeof(req)) continue;   /* 超时重来 */
-
-        SwlinkFtHeader resp = req;          /* magic/cmd/seq 回显 */
-        resp.status = SWLINK_FT_OK;
-        resp.offset = 0;
-        resp.size = 0;
-
-        if (req.magic != SWLINK_FT_MAGIC || req.payload_len > SWLINK_FT_CHUNK) {
-            resp.status = SWLINK_FT_ERR_BAD_REQUEST;
-            respond(&resp, NULL, 0);
-            continue;
-        }
-
-        u8* payload = g_buf + sizeof(SwlinkFtHeader);
-        if (req.payload_len) {
-            got = swlinkUsbRead(USB_INTF_FILE, payload, req.payload_len, USB_TIMEOUT);
-            if (got != req.payload_len) continue;
-        }
-
-        char path[SWLINK_FT_PATH_MAX + 1];
-        u32 err = SWLINK_FT_OK;
-
-        switch (req.cmd) {
-        case SwlinkFt_Ping: {
-            const char* ver = SWLINK_PROTO_VERSION;
-            respond(&resp, ver, sizeof(SWLINK_PROTO_VERSION));
-            break;
-        }
-        case SwlinkFt_List:
-            err = parsePath(payload, req.payload_len, path, sizeof(path), NULL);
-            if (err == SWLINK_FT_OK) err = handleList(&resp, path, req.offset);
-            break;
-        case SwlinkFt_Stat:
-            err = parsePath(payload, req.payload_len, path, sizeof(path), NULL);
-            if (err == SWLINK_FT_OK) err = handleStat(&resp, path);
-            break;
-        case SwlinkFt_Read:
-            err = parsePath(payload, req.payload_len, path, sizeof(path), NULL);
-            if (err == SWLINK_FT_OK) err = handleRead(&resp, path, req.offset, req.size);
-            break;
-        case SwlinkFt_Write: {
-            /* payload = [u16 len][path][data...] */
-            u32 consumed = 0;
-            err = parsePath(payload, req.payload_len, path, sizeof(path), &consumed);
-            if (err == SWLINK_FT_OK) {
-                if (consumed + req.size > req.payload_len)
-                    err = SWLINK_FT_ERR_BAD_REQUEST;
-                else
-                    err = handleWrite(&resp, path, req.offset, req.size, payload + consumed);
-            }
-            break;
-        }
-        case SwlinkFt_Mkdir:
-            err = parsePath(payload, req.payload_len, path, sizeof(path), NULL);
-            if (err == SWLINK_FT_OK) err = handleMkdir(&resp, path);
-            break;
-        case SwlinkFt_Delete:
-            err = parsePath(payload, req.payload_len, path, sizeof(path), NULL);
-            if (err == SWLINK_FT_OK) err = handleDelete(&resp, path, (req.offset & 1) != 0);
-            break;
-        case SwlinkFt_Rename:
-            err = handleRename(&resp, payload, req.payload_len);
-            break;
-        case SwlinkFt_StatFs:
-            err = parsePath(payload, req.payload_len, path, sizeof(path), NULL);
-            if (err == SWLINK_FT_OK) err = handleStatFs(&resp, path);
-            break;
-        default:
-            err = SWLINK_FT_ERR_BAD_REQUEST;
-            break;
-        }
-
-        /* 处理函数内部成功时已自行回响应;这里统一回错误 */
-        if (err != SWLINK_FT_OK) {
-            resp.status = err;
-            respond(&resp, NULL, 0);
-        }
+        /* USB 超时只会返回 0,readFull 会继续等;false 仅代表半截请求作废 */
+        handleOne(&s);
     }
 }

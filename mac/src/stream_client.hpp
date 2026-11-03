@@ -9,7 +9,7 @@
 #include <functional>
 #include <thread>
 
-class UsbLink;
+class Link;
 
 class StreamClient {
 public:
@@ -17,7 +17,7 @@ public:
     using AudioCb = std::function<void(const uint8_t* data, uint32_t len)>;
     using DropCb  = std::function<void()>;   /* 连接中断 */
 
-    explicit StreamClient(UsbLink& link) : link_(link) {}
+    explicit StreamClient(Link& link) : link_(link) {}
 
     void start(VideoCb v, AudioCb a, DropCb d);
     void stop();
@@ -26,7 +26,7 @@ public:
 private:
     void loop(VideoCb v, AudioCb a, DropCb d);
 
-    UsbLink& link_;
+    Link& link_;
     std::thread th_;
     std::atomic<bool> running_{false};
 };

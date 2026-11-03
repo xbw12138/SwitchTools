@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-class UsbLink;
+class Link;
 
 struct FtEntry {
     uint8_t type;        /* 1=目录 2=文件 */
@@ -23,7 +23,7 @@ class FileClient {
 public:
     using ProgressCb = std::function<void(uint64_t done, uint64_t total)>;
 
-    explicit FileClient(UsbLink& link) : link_(link) {}
+    explicit FileClient(Link& link) : link_(link) {}
 
     bool ping();
     bool list(const std::string& path, std::vector<FtEntry>& out);
@@ -50,7 +50,7 @@ private:
 
     static std::vector<uint8_t> packPath(const std::string& path);
 
-    UsbLink& link_;
+    Link& link_;
     uint32_t seq_ = 0;
     std::string err_;
     std::atomic<bool>* cancel_ = nullptr;

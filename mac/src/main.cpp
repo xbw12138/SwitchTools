@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <chrono>
 #include <dirent.h>
 #include <mutex>
 #include <string>
@@ -16,16 +17,24 @@
 #include <thread>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <SDL.h>
 #include <imgui.h>
 #include <imgui_impl_sdl2.h>
 #include <imgui_impl_sdlrenderer2.h>
 
+#include "link.hpp"
 #include "usb_link.hpp"
 #include "stream_client.hpp"
 #include "video_decoder.hpp"
 #include "audio_output.hpp"
 #include "file_client.hpp"
+#include "nxlink_client.hpp"
 #include "../../protocol/swlink_protocol.h"
 
 /* ---------------- 配色 ---------------- */
@@ -43,11 +52,15 @@
 #define COL_ROW_SEL     IM_COL32( 82,142,255, 30)
 
 /* ---------------- 全局状态 ---------------- */
-static UsbLink g_link;
-static StreamClient g_stream(g_link);
+static UsbLink g_usbLink;
+static Link* g_link = &g_usbLink;
+static StreamClient* g_stream = nullptr;
 static VideoDecoder g_decoder;
 static AudioOutput g_audio;
 static FileClient* g_files = nullptr;
+
+/* nxlink 推送用的 Switch IP(自动记住) */
+static char g_switchIp[64] = "";
 
 static ImFont* g_fontTitle = nullptr;
 static float g_pixelScale = 1.0f;
@@ -59,6 +72,26 @@ static std::string g_status = "未连接";
 static std::mutex g_errMutex;
 static std::string g_errorText;
 
+/* nxlink:向 hbmenu 推送 NRO 并接收程序输出 */
+static NxlinkHost g_nxlink;
+static char g_nxNroPath[512] = "";
+static char g_nxSdPath[256] = "switch/";
+static std::atomic<bool> g_nxBusy{false};
+static std::mutex g_nxStatusMutex;
+static std::string g_nxStatus;
+
+static void setNxStatus(const std::string& s)
+{
+    std::lock_guard<std::mutex> lk(g_nxStatusMutex);
+    g_nxStatus = s;
+}
+
+static std::string nxStatus()
+{
+    std::lock_guard<std::mutex> lk(g_nxStatusMutex);
+    return g_nxStatus;
+}
+
 static SDL_Window* g_window = nullptr;
 /* 独立串流窗口(可拖到副屏/单独放大) */
 static SDL_Window* g_vwin = nullptr;
@@ -66,7 +99,7 @@ static SDL_Renderer* g_vrend = nullptr;
 static SDL_Texture* g_vtex = nullptr;
 static uint64_t g_vframe = 0;
 static int g_vtexW = 0, g_vtexH = 0;
-static int g_page = 0;          /* 0 = 串流, 1 = 文件, 2 = 帮助 */
+static int g_page = 0;          /* 0 = 串流, 1 = 文件, 2 = nxlink, 3 = 帮助 */
 static bool g_muted = false;
 static float g_fps = 0.0f;
 
@@ -94,7 +127,8 @@ static void clearError()
 /* UI 用到的全部汉字:ImGui 的"常用字"范围并不覆盖所有字形(如"屏"),
    缺字会渲染成方块,因此把界面实际出现的汉字补进字形范围 */
 static const char kUiCjk[] =
-    "一上下不与两个中串为主乱了交产人以件任优会传位住体余作使侧便保信停先免入全共关内再写出击分切列创初删到制刷前剩功加务动助包化匹区协单卡即压原双取口只可台右同名后否含启命和响器固图在地址型塞填声处备复多大失头夹始字存安完定客容小尚局层屏屑展属工左已带帧帮常并序底度延建开归当录影径待忽态总息慎戏成或截户手才打执找把折护拖持指按换据排接提搜操支改数文断新无旧时是有未本机材束条板染查标栏样根检次正此每气没法流浏消渲游滤灯点版状率现理生用由画界留略的目直码硬确示秒称程稍空窗立端等管类系索级纸线终结绘给统编置能自致色节若菜行表装要视览角解计认让议设误请读调谨象败质跨路载输边过运进远连迟选递通速避部配采里重量钮锁错锚键长间阻除集需静面音页顶项顺顿预频题首独闭显回";
+    "一上下不与两个中串为主乱了交产人以件任优会传位住体余作使侧便保信停先免入全共关内再写出击分切列创初删到制刷前剩功加务动助包化匹区协单卡即压原双取口只可台右同名后否含启命和响器固图在地址型塞填声处备复多大失头夹始字存安完定客容小尚局层屏屑展属工左已带帧帮常并序底度延建开归当录影径待忽态总息慎戏成或截户手才打执找把折护拖持指按换据排接提搜操支改数文断新无旧时是有未本机材束条板染查标栏样根检次正此每气没法流浏消渲游滤灯点版状率现理生用由画界留略的目直码硬确示秒称程稍空窗立端等管类系索级纸线终结绘给统编置能自致色节若菜行表装要视览角解计认让议设误请读调谨象败质跨路载输边过运进远连迟选递通速避部配采里重量钮锁错锚键长间阻除集需静面音页顶项顺顿预频题首独闭显回"
+    "域网搜索中填再使没鉴权络抖丢来花睡眠";
 
 static void loadFonts()
 {
@@ -225,30 +259,73 @@ static std::string ftStatus()
     return g_ftStatus;
 }
 
+/* ---------------- 设置 ---------------- */
+
+static std::string settingsPath()
+{
+    const char* home = getenv("HOME");
+    if (!home) return std::string();
+    return std::string(home) + "/.swlink.conf";
+}
+
+/* 记住上次填写的 Switch IP(nxlink 推送用),省得每次重输 */
+static void loadSettings()
+{
+    FILE* f = fopen(settingsPath().c_str(), "r");
+    if (!f) return;
+
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "ip=", 3) != 0)
+            continue;
+        std::string ip(line + 3);
+        while (!ip.empty() && (ip.back() == '\n' || ip.back() == '\r'))
+            ip.pop_back();
+        if (!ip.empty() && ip.size() < sizeof(g_switchIp))
+            snprintf(g_switchIp, sizeof(g_switchIp), "%s", ip.c_str());
+    }
+    fclose(f);
+}
+
+static void saveSettings()
+{
+    const std::string path = settingsPath();
+    if (path.empty()) return;
+
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) return;
+    fprintf(f, "ip=%s\n", g_switchIp);
+    fclose(f);
+}
+
 /* ---------------- 连接管理 ---------------- */
 
 static bool connectDevice()
 {
     clearError();
-    if (!g_link.open()) { setError(g_link.lastError()); return false; }
-    if (!g_link.handshake(true, true, 3)) {
-        setError(g_link.lastError());
-        g_link.close();
+
+    g_link = &g_usbLink;
+
+    if (!g_link->open()) { setError(g_link->lastError()); return false; }
+    if (!g_link->handshake(true, true, 3)) {
+        setError(g_link->lastError());
+        g_link->close();
         return false;
     }
 
-    if (!g_decoder.init()) { setError("解码器初始化失败"); g_link.close(); return false; }
+    if (!g_decoder.init()) { setError("解码器初始化失败"); g_link->close(); return false; }
     if (!g_audio.init())   { /* 音频失败不致命 */ }
     g_audio.setMuted(g_muted);
 
-    g_files = new FileClient(g_link);
+    g_files = new FileClient(*g_link);
     g_files->setCancelFlag(&g_ftCancel);
     g_ftCancel = false;
     g_connected = true;
     g_status = "已连接,串流中";
     g_filesLoaded = false;   /* 首次进文件页时自动列根目录 */
 
-    g_stream.start(
+    g_stream = new StreamClient(*g_link);
+    g_stream->start(
         [](const uint8_t* d, uint32_t l, uint8_t) { g_decoder.feed(d, l); },
         [](const uint8_t* d, uint32_t l) { g_audio.queue(d, l); },
         []() { g_connected = false; g_status = "连接已断开"; });
@@ -257,11 +334,15 @@ static bool connectDevice()
 
 static void disconnectDevice()
 {
-    g_stream.stop();
+    if (g_stream) {
+        g_stream->stop();
+        delete g_stream;
+        g_stream = nullptr;
+    }
     g_audio.shutdown();
     g_decoder.shutdown();
     delete g_files; g_files = nullptr;
-    g_link.close();
+    g_link->close();
     g_connected = false;
     g_status = "未连接";
     g_entries.clear();
@@ -473,6 +554,13 @@ static void drawTopBar()
     const float stW = ImGui::CalcTextSize(st).x;
     const ImVec2 stPos(btnPos.x - 30 - stW, p.y + h * 0.5f - ImGui::GetTextLineHeight() * 0.5f);
 
+    /* 通道信息:USB */
+    const char* chanInfo = g_connected ? "USB" : "";
+    if (g_connected) {
+        const float infoW = ImGui::CalcTextSize(chanInfo).x;
+        dl->AddText(ImVec2(stPos.x - 26.0f - infoW, stPos.y), COL_TEXT_DIM, chanInfo);
+    }
+
     dl->AddCircleFilled(ImVec2(stPos.x - 14, p.y + h * 0.5f), 5.0f,
                         g_connected ? COL_OK : COL_ERR);
     dl->AddText(stPos, g_connected ? COL_TEXT_DIM
@@ -539,7 +627,8 @@ static void drawSidebar()
     ImGui::BeginGroup();
     navItem("串流画面", 0);
     navItem("SD 卡文件", 1);
-    navItem("使用帮助", 2);
+    navItem("nxlink 推送", 2);
+    navItem("使用帮助", 3);
     ImGui::EndGroup();
 
     /* 底部:连接状态 + 版本 */
@@ -1452,6 +1541,141 @@ static void helpRow(const char* title, const char* body)
     ImGui::PopStyleColor();
 }
 
+/* ---------------- nxlink 页 ---------------- */
+
+static bool endsWithNro(const std::string& s)
+{
+    return s.size() > 4 && s.compare(s.size() - 4, 4, ".nro") == 0;
+}
+
+static void startNxlinkPush()
+{
+    if (g_nxBusy.load())
+        return;
+
+    if (g_switchIp[0] == '\0') {
+        setNxStatus("请先填写 Switch 的 IP 地址");
+        return;
+    }
+    if (g_nxNroPath[0] == '\0') {
+        setNxStatus("请先选择本地的 .nro 文件(也可直接拖进窗口)");
+        return;
+    }
+    if (!endsWithNro(g_nxSdPath)) {
+        setNxStatus("Switch 上的保存路径必须以 .nro 结尾");
+        return;
+    }
+
+    const std::string ip = g_switchIp;
+    const std::string nro = g_nxNroPath;
+    const std::string sd = g_nxSdPath;
+
+    g_nxBusy = true;
+    setNxStatus("正在上传...");
+
+    std::thread([ip, nro, sd]() {
+        std::string err;
+        /* 先开始监听,被拉起的程序会连回本机 28280 */
+        if (!g_nxlink.startStdio(28280, &err)) {
+            setNxStatus("输出服务启动失败: " + err);
+            g_nxBusy = false;
+            return;
+        }
+        if (!g_nxlink.upload(ip, 28280, nro, sd, &err))
+            setNxStatus("推送失败: " + err);
+        else
+            setNxStatus("已推送,等待程序输出...");
+        g_nxBusy = false;
+    }).detach();
+}
+
+static void drawNxlinkPage()
+{
+    ImGui::PushFont(g_fontTitle);
+    ImGui::TextUnformatted("nxlink 推送");
+    ImGui::PopFont();
+
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_TEXT_DIM));
+    ImGui::TextWrapped(
+        "把本地 .nro 推送到 Switch 并在内存中运行,同时把程序的 printf 输出显示在下面。"
+        "使用前请在 Switch 上启动 hbmenu(按住 R 键启动进入全内存模式),它会在 28280 端口等待接收。");
+    ImGui::PopStyleColor();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::BeginDisabled(g_nxBusy.load());
+
+    ImGui::SetNextItemWidth(180);
+    if (ImGui::InputTextWithHint("##nxip", "Switch IP", g_switchIp, sizeof(g_switchIp)))
+        saveSettings();
+    ImGui::SameLine();
+    ImGui::TextDisabled("Switch 地址");
+
+    ImGui::SetNextItemWidth(520);
+    ImGui::InputTextWithHint("##nxnro", "本地 .nro 文件路径(可拖拽文件到窗口)",
+                             g_nxNroPath, sizeof(g_nxNroPath));
+
+    ImGui::SetNextItemWidth(520);
+    ImGui::InputTextWithHint("##nxdest", "Switch 上的保存路径,如 switch/xxx.nro",
+                             g_nxSdPath, sizeof(g_nxSdPath));
+
+    ImGui::Spacing();
+    if (ImGui::Button(g_nxBusy.load() ? "上传中..." : "推送并运行", ImVec2(120, 34)))
+        startNxlinkPush();
+    ImGui::SameLine();
+    if (ImGui::Button("清空日志", ImVec2(96, 34)))
+        g_nxlink.clearLog();
+
+    ImGui::EndDisabled();
+
+    ImGui::SameLine();
+    if (g_nxlink.stdioListening()) {
+        if (ImGui::Button("停止监听", ImVec2(96, 34))) {
+            g_nxlink.stopStdio();
+            setNxStatus("已停止监听");
+        }
+    } else {
+        ImGui::BeginDisabled(true);
+        ImGui::Button("未监听", ImVec2(96, 34));
+        ImGui::EndDisabled();
+    }
+
+    ImGui::SameLine();
+    const std::string status = nxStatus();
+    const bool connected = g_nxlink.stdioConnected();
+    ImGui::TextColored(connected ? ImGui::ColorConvertU32ToFloat4(COL_OK)
+                                 : ImGui::ColorConvertU32ToFloat4(COL_TEXT_DIM),
+                       "%s", connected ? "输出已连接" : "");
+    if (!status.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", status.c_str());
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 10));
+    ImGui::BeginChild("##nxlog", ImVec2(0, avail.y > 40 ? avail.y : 40), true,
+                      ImGuiWindowFlags_HorizontalScrollbar);
+
+    const bool atBottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f;
+    const std::string log = g_nxlink.logSnapshot();
+    if (log.empty())
+        ImGui::TextDisabled("程序输出会显示在这里");
+    else
+        ImGui::TextUnformatted(log.c_str());
+    if (atBottom)
+        ImGui::SetScrollHereY(1.0f);
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+}
+
 static void drawHelpPage()
 {
     ImGui::PushFont(g_fontTitle);
@@ -1522,6 +1746,7 @@ int main(int, char**)
     ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer2_Init(renderer);
     loadFonts();
+    loadSettings();
 
     bool running = true;
     std::vector<std::string> dropped;          /* 拖入的文件,下一帧上传 */
@@ -1562,9 +1787,18 @@ int main(int, char**)
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        /* 拖入的文件上传到文件页当前目录 */
+        /* 拖入的文件:nxlink 页作为待推送 NRO,其它页上传到文件页当前目录 */
         if (!dropped.empty()) {
-            if (!g_files) {
+            if (g_page == 2) {
+                const std::string& p = dropped.front();
+                snprintf(g_nxNroPath, sizeof(g_nxNroPath), "%s", p.c_str());
+                if (endsWithNro(p) && strcmp(g_nxSdPath, "switch/") == 0) {
+                    const char* base = strrchr(p.c_str(), '/');
+                    base = base ? base + 1 : p.c_str();
+                    snprintf(g_nxSdPath, sizeof(g_nxSdPath), "switch/%s", base);
+                }
+                setNxStatus("已选择文件,点\"推送并运行\"");
+            } else if (!g_files) {
                 setError("请先连接 Switch,再拖入文件上传");
             } else if (g_ftBusy) {
                 setError("有传输任务进行中,请稍后再拖入文件");
@@ -1602,6 +1836,8 @@ int main(int, char**)
             drawStreamPage(renderer);
         else if (g_page == 1)
             drawFilePage();
+        else if (g_page == 2)
+            drawNxlinkPage();
         else
             drawHelpPage();
         ImGui::EndChild();
@@ -1621,7 +1857,6 @@ int main(int, char**)
         drawVideoWindow();
     }
 
-    g_stream.stop();
     disconnectDevice();
 
     closeVideoWindow();

@@ -1,6 +1,6 @@
 # SwLink
 
-USB 连接 Switch(大气层 Atmosphere)与 macOS,实现 **游戏画面+音频串流** 和 **SD 卡文件传输**。
+USB 线连接 Switch(大气层 Atmosphere)与 macOS,实现 **游戏画面+音频串流** 和 **SD 卡文件传输**。
 
 全自研两端,不依赖 SysDVR:
 
@@ -60,13 +60,15 @@ open build/SwLink.app    # 双击 App 即可运行,无需命令行
 
 ## 三、使用
 
-1. Switch 开机(确保 SwLink sysmodule 已启动),USB 线连 Mac
-2. 打开 SwLink.app,「串流画面」页点右上角 **连接 Switch**
+1. Switch 开机(确保 SwLink sysmodule 已启动);USB 线连 Mac
+2. 打开 SwLink.app,点 **连接 Switch**
 3. 进游戏即出画面和声音;「独立窗口」可把纯画面弹到单独窗口(可缩放到副屏/外接屏),
    打开后主窗口停止渲染画面
 4. 「SD 卡文件」页可浏览 SD 卡、多选/递归下载、上传(支持整目录拖入)、新建/重命名/批量删除;
    点表头排序,传输中显示速度、剩余时间并可取消,底部显示 SD 剩余容量
 5. 把本地文件或文件夹直接拖进窗口,即可上传到当前目录
+
+> 「nxlink 推送」页的 Switch IP 会记在 `~/.swlink.conf`,下次启动自动填好。
 
 ## 四、限制与注意事项
 
@@ -86,9 +88,10 @@ switch/                      sysmodule(devkitPro 工程)
   source/capture.c           grc:d 采集(H.264+PCM,SPS/PPS 注入)
   source/stream_server.c     握手 + 流发送(视频 main 线程,音频独立线程)
   source/file_server.c       SD 卡文件服务(原生 fs IPC,无堆)
-  source/main.c              入口,256KB 静态堆,拉起各线程
+  source/main.c              入口,2MB 静态堆,拉起各线程
   Makefile / swlink.json     构建配置(title id 00FF0000A53B5A57)
 mac/                         macOS 客户端(CMake 工程)
+  src/link.hpp               传输层抽象接口(StreamClient/FileClient 只依赖它)
   src/usb_link.cpp           libusb 连接/握手/端点读写
   src/stream_client.cpp      流拆包线程
   src/video_decoder.cpp      FFmpeg H.264 解码 -> SDL YUV 纹理

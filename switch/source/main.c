@@ -12,8 +12,10 @@
 #include "stream_server.h"
 #include "file_server.h"
 
-/* ---- 静态内堆:不再禁用堆,避免 libnx 初始化里任何 malloc 直接 fatalThrow ---- */
-#define INNER_HEAP_SIZE 0x40000
+/* ---- 静态内堆 ----
+ * (无堆分配,仅 newlib/运行时的少量需求)
+ */
+#define INNER_HEAP_SIZE 0x200000
 size_t nx_inner_heap_size = INNER_HEAP_SIZE;
 char nx_inner_heap[INNER_HEAP_SIZE];
 
