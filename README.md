@@ -70,6 +70,25 @@ open build/SwLink.app    # 双击 App 即可运行,无需命令行
 6. 「NRO 推送」页把本地 `.nro` 经 USB 写入 SD 卡(默认 `switch/`),之后在 Switch 上
    按住 R 启动 hbmenu,进 `switch` 目录点选即可运行
 
+### 命令行(swlink-cli)
+
+图形界面之外还提供一个命令行工具,共用同一套 USB 协议,适合脚本/批量操作:
+
+```sh
+cd mac && cmake --build build -j        # 产物:mac/build/swlink-cli
+./build/swlink-cli --help
+
+./build/swlink-cli ls /switch                  # 列目录
+./build/swlink-cli nro ./hbmenu.nro            # 推送到 /switch/hbmenu.nro
+./build/swlink-cli put ./payload /switch       # 上传文件或整个目录(递归)
+./build/swlink-cli get /switch/logs ./logs     # 下载文件;目录则递归下载
+./build/swlink-cli mkdir /switch/new
+./build/swlink-cli rm /switch/old --dir
+./build/swlink-cli df                          # SD 卡容量
+```
+
+> swlink-cli 与 SwLink.app **不能同时占用设备**,使用前先退出 App(USB 接口是独占的)。
+
 ## 四、限制与注意事项
 
 - **只有支持系统录屏(长按截图键)的游戏才能采集**。不支持的游戏和主菜单 `grc:d` 会无限阻塞(无画面,属正常现象)。建议安装 [dvr-patches](https://github.com/exelix11/dvr-patches) 解锁全部游戏

@@ -1538,7 +1538,9 @@ static void startNxlinkPush()
     }
 
     const std::string nro = g_nxNroPath;
-    const std::string sd = g_nxSdPath;
+    /* 设备端要求远端路径以 / 开头 */
+    std::string sd = g_nxSdPath;
+    if (sd[0] != '/') sd.insert(sd.begin(), '/');
 
     g_nxBusy = true;
     g_nxPercent = 0;
@@ -1553,8 +1555,8 @@ static void startNxlinkPush()
         }
 
         /* hbmenu 只列 switch 目录,目录不存在就先建一个 */
-        if (sd.rfind("switch/", 0) == 0)
-            files->mkdir("switch");
+        if (sd.rfind("/switch/", 0) == 0)
+            files->mkdir("/switch");
 
         const bool ok = files->writeFile(nro, sd, [](uint64_t done, uint64_t total) {
             if (total > 0)

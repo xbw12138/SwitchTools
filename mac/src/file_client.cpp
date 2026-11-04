@@ -34,9 +34,12 @@ bool FileClient::request(uint32_t cmd, uint64_t offset, uint64_t size,
     hdr.size = size;
     hdr.payload_len = (uint32_t)payload.size();
 
-    if (!link_.fileWrite(&hdr, sizeof(hdr), USB_TIMEOUT_MS) ||
-        (hdr.payload_len && !link_.fileWrite(payload.data(), hdr.payload_len, USB_TIMEOUT_MS))) {
-        err_ = "发送请求失败";
+    if (!link_.fileWrite(&hdr, sizeof(hdr), USB_TIMEOUT_MS)) {
+        err_ = "发送请求头失败";
+        return false;
+    }
+    if (hdr.payload_len && !link_.fileWrite(payload.data(), hdr.payload_len, USB_TIMEOUT_MS)) {
+        err_ = "发送请求负载失败";
         return false;
     }
 

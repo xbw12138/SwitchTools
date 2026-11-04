@@ -9,7 +9,9 @@ mac/build/
 *.nacp
 
 # 本地编译的第三方库 (体积大, 按 setup.sh 重新生成)
-mac/third_party/
+# imgui 是纯源码且构建必须, 随仓库提交
+mac/third_party/*
+!mac/third_party/imgui/
 
 # macOS
 .DS_Store

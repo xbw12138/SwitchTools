@@ -91,12 +91,20 @@ void UsbLink::close()
     }
 }
 
+/*
+ * 单次 bulk 传输上限必须与设备端吻合(设备按 32KB 一档投递读写缓冲)。
+ * 一次提交过大的传输,设备端偏移对不上就可能中途取消,而取消会在设备端
+ * 留下一个永远不完成的挂起读请求,把文件端点彻底堵死,只能重启主机。
+ */
+static const int kIoSlice = 0x8000;
+
 bool UsbLink::readExact(uint8_t ep, void* data, int len, unsigned timeoutMs)
 {
     uint8_t* p = (uint8_t*)data;
     while (len > 0) {
+        int want = len > kIoSlice ? kIoSlice : len;
         int got = 0;
-        int rc = libusb_bulk_transfer(dev_, ep, p, len, &got, timeoutMs);
+        int rc = libusb_bulk_transfer(dev_, ep, p, want, &got, timeoutMs);
         if (rc == LIBUSB_ERROR_TIMEOUT && got == 0) return false;
         if (rc != 0 && rc != LIBUSB_ERROR_TIMEOUT) return false;
         p += got;
@@ -109,8 +117,9 @@ bool UsbLink::writeExact(uint8_t ep, const void* data, int len, unsigned timeout
 {
     const uint8_t* p = (const uint8_t*)data;
     while (len > 0) {
+        int want = len > kIoSlice ? kIoSlice : len;
         int sent = 0;
-        int rc = libusb_bulk_transfer(dev_, ep, (uint8_t*)p, len, &sent, timeoutMs);
+        int rc = libusb_bulk_transfer(dev_, ep, (uint8_t*)p, want, &sent, timeoutMs);
         if (rc == LIBUSB_ERROR_TIMEOUT && sent == 0) return false;
         if (rc != 0 && rc != LIBUSB_ERROR_TIMEOUT) return false;
         p += sent;

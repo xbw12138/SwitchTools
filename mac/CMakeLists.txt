@@ -14,13 +14,11 @@ pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
 pkg_check_modules(AVCODEC REQUIRED libavcodec)
 pkg_check_modules(AVUTIL REQUIRED libavutil)
 
-# ImGui 源码拉取 (ocornut/imgui + SDL2 后端)
-include(FetchContent)
-FetchContent_Declare(imgui
-    GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG v1.91.5
-)
-FetchContent_MakeAvailable(imgui)
+# ImGui 源码内置在 third_party/imgui(ocornut/imgui v1.91.5),构建时无需联网
+set(IMGUI_DIR "${CMAKE_SOURCE_DIR}/third_party/imgui")
+if(NOT EXISTS "${IMGUI_DIR}/imgui.cpp")
+    message(FATAL_ERROR "缺少 ${IMGUI_DIR}/imgui.cpp,请放入 ocornut/imgui v1.91.5 源码")
+endif()
 
 add_executable(swlink
     src/main.cpp
@@ -29,17 +27,17 @@ add_executable(swlink
     src/video_decoder.cpp
     src/audio_output.cpp
     src/file_client.cpp
-    ${imgui_SOURCE_DIR}/imgui.cpp
-    ${imgui_SOURCE_DIR}/imgui_draw.cpp
-    ${imgui_SOURCE_DIR}/imgui_tables.cpp
-    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer2.cpp
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_sdl2.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_sdlrenderer2.cpp
 )
 
 target_include_directories(swlink PRIVATE
-    ${imgui_SOURCE_DIR}
-    ${imgui_SOURCE_DIR}/backends
+    ${IMGUI_DIR}
+    ${IMGUI_DIR}/backends
     ${SDL2_INCLUDE_DIRS}
     ${LIBUSB_INCLUDE_DIRS}
     ${AVCODEC_INCLUDE_DIRS}
@@ -59,6 +57,17 @@ target_link_libraries(swlink PRIVATE
     ${AVCODEC_LIBRARIES}
     ${AVUTIL_LIBRARIES}
 )
+
+# ---- 命令行工具:通过 USB 操作 SD 卡(含 NRO 推送) ----
+add_executable(swlink-cli
+    src/cli.cpp
+    src/usb_link.cpp
+    src/file_client.cpp
+)
+
+target_include_directories(swlink-cli PRIVATE ${LIBUSB_INCLUDE_DIRS})
+target_link_directories(swlink-cli PRIVATE ${LIBUSB_LIBRARY_DIRS})
+target_link_libraries(swlink-cli PRIVATE ${LIBUSB_LIBRARIES})
 
 # ---- 打包成可直接双击的 SwLink.app ----
 set_target_properties(swlink PROPERTIES

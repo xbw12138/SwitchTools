@@ -4,14 +4,30 @@
  * (原生 fs IPC,不经过 fsdev,无堆分配)
  */
 #include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
 
 #include "file_server.h"
 #include "usb_link.h"
 #include "../../protocol/swlink_protocol.h"
 
+extern void sdLog(const char* text);
+
 #define FT_TIMEOUT 3E+9
 /* 读请求时每 0.5s 醒一次,给退出标志和断线检测留出机会 */
 #define FT_SLICE   5E+8
+/* 单次 USB 传输上限:一次投递几百 KB 会被 usb:ds 拒绝,必须切片 */
+#define FT_IO_SLICE 0x8000
+
+static void ftLog(const char* fmt, ...)
+{
+    char line[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    sdLog(line);
+}
 
 typedef struct {
     u8* buf;              /* sizeof(SwlinkFtHeader) + SWLINK_FT_CHUNK */
@@ -53,6 +69,22 @@ static u32 parsePath(const u8* payload, u32 payload_len, char* out, u32 out_size
     return SWLINK_FT_OK;
 }
 
+static size_t writeAll(const void* data, size_t size)
+{
+    const u8* p = (const u8*)data;
+    size_t sent = 0;
+
+    while (sent < size) {
+        u32 want = (u32)(size - sent);
+        if (want > FT_IO_SLICE) want = FT_IO_SLICE;
+
+        size_t n = swlinkUsbWrite(USB_INTF_FILE, p + sent, want, FT_TIMEOUT);
+        if (n == 0) return 0;
+        sent += n;
+    }
+    return sent;
+}
+
 static size_t respond(FileSession* s, SwlinkFtHeader* resp, const void* payload, u32 payload_len)
 {
     size_t total = sizeof(SwlinkFtHeader) + payload_len;
@@ -61,7 +93,7 @@ static size_t respond(FileSession* s, SwlinkFtHeader* resp, const void* payload,
     /* 处理函数可能已直接在 buf payload 区构建数据,避免同地址拷贝 */
     if (payload_len && (const u8*)payload != s->buf + sizeof(SwlinkFtHeader))
         memcpy(s->buf + sizeof(SwlinkFtHeader), payload, payload_len);
-    return swlinkUsbWrite(USB_INTF_FILE, s->buf, total, FT_TIMEOUT) == total ? total : 0;
+    return writeAll(s->buf, total) == total ? total : 0;
 }
 
 /* 收满 size 字节;false = 断开或已停止运行 */
@@ -75,11 +107,16 @@ static bool readFull(FileSession* s, void* dst, u32 size)
         if (!g_fileRunning)
             return false;
 
-        size_t n = swlinkUsbRead(USB_INTF_FILE, p + got, size - got, FT_SLICE);
+        u32 want = size - got;
+        if (want > FT_IO_SLICE) want = FT_IO_SLICE;
+
+        size_t n = swlinkUsbRead(USB_INTF_FILE, p + got, want, FT_SLICE);
         if (n == 0) {
             /* 半截请求停滞 3 秒(USB 拔插):丢弃并重新同步 */
-            if (got > 0 && ++idleSlices >= 6)
+            if (got > 0 && ++idleSlices >= 6) {
+                ftLog("FT 读负载中断 got=%u/%u", got, size);
                 return false;
+            }
             continue;
         }
         idleSlices = 0;
@@ -143,21 +180,28 @@ static u32 handleStat(FileSession* s, SwlinkFtHeader* resp, const char* path)
     Result rc = fsFsGetEntryType(s->sd, path, &type);
     if (R_FAILED(rc)) return mapError(rc);
 
-    struct { u8 type; u64 size; } st;
-    st.type = (type == FsDirEntryType_Dir) ? 1 : 2;
-    st.size = 0;
+    /*
+     * 响应格式必须与 LIST 条目一致:[u8 type][u64 size] 紧凑 9 字节。
+     * 不能直接用结构体:u64 要求 8 字节对齐,编译器会在 type 后面塞 7 字节
+     * 填充,size 落到偏移 8;客户端按偏移 1 读 size 就会读到填充 + 最低字节
+     * (1 字节文件变成 0x01<<56,4096 这类低字节为 0 的文件直接变 0)。
+     */
+    u8 st[9];
+    st[0] = (type == FsDirEntryType_Dir) ? 1 : 2;
 
-    if (st.type == 2) {
+    u64 size = 0;
+    if (st[0] == 2) {
         FsFile f;
         rc = fsFsOpenFile(s->sd, path, FsOpenMode_Read, &f);
         if (R_FAILED(rc)) return mapError(rc);
         s64 sz = 0;
         fsFileGetSize(&f, &sz);
         fsFileClose(&f);
-        st.size = (u64)sz;
+        size = (u64)sz;
     }
+    memcpy(st + 1, &size, sizeof(size));
 
-    return respond(s, resp, &st, sizeof(st)) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
+    return respond(s, resp, st, sizeof(st)) ? SWLINK_FT_OK : SWLINK_FT_ERR_IO;
 }
 
 static u32 handleRead(FileSession* s, SwlinkFtHeader* resp, const char* path, u64 offset, u64 size)
@@ -187,15 +231,30 @@ static u32 handleWrite(FileSession* s, SwlinkFtHeader* resp, const char* path, u
     FsFile f;
     Result rc = fsFsOpenFile(s->sd, path, FsOpenMode_Write | FsOpenMode_Append, &f);
     if (R_FAILED(rc)) {
-        rc = fsFsCreateFile(s->sd, path, offset + size, 0);
-        if (R_FAILED(rc)) return mapError(rc);
+        /* 先建 0 字节文件, 再 SetSize 扩到目标长度(不做预分配) */
+        rc = fsFsCreateFile(s->sd, path, 0, 0);
+        if (R_FAILED(rc)) {
+            s64 freeSpace = 0;
+            Result rcFree = fsFsGetFreeSpace(s->sd, "/", &freeSpace);
+            FsDirEntryType t;
+            Result rcType = fsFsGetEntryType(s->sd, path, &t);
+            ftLog("FT create rc=0x%08x free=%lld(%08x) type=%08x path=%s",
+                  rc, (long long)freeSpace, rcFree, rcType, path);
+            return mapError(rc);
+        }
         rc = fsFsOpenFile(s->sd, path, FsOpenMode_Write, &f);
-        if (R_FAILED(rc)) return mapError(rc);
+        if (R_FAILED(rc)) {
+            ftLog("FT reopen rc=0x%08x", rc);
+            return mapError(rc);
+        }
     }
 
     rc = fsFileSetSize(&f, offset + size);
+    if (R_FAILED(rc)) ftLog("FT write setsize rc=0x%08x", rc);
     if (R_SUCCEEDED(rc)) rc = fsFileWrite(&f, offset, data, size, FsWriteOption_Flush);
+    if (R_FAILED(rc)) ftLog("FT write data rc=0x%08x", rc);
     if (R_SUCCEEDED(rc)) rc = fsFileFlush(&f);
+    if (R_FAILED(rc)) ftLog("FT write flush rc=0x%08x", rc);
     fsFileClose(&f);
 
     if (R_FAILED(rc)) return mapError(rc);
@@ -259,6 +318,14 @@ static u32 handleRename(FileSession* s, SwlinkFtHeader* resp, const u8* payload,
 }
 
 /* 处理一次完整请求;false = 通道断开/停止 */
+/*
+ * 负载缓冲必须 4KB 对齐。usb_link 对非对齐缓冲会走 4KB 中转读写,
+ * 主机若一次写入 32KB 而设备只投递了 4KB,多出的数据会被端点丢弃,
+ * 之后该端点再也无法完成读请求(只能重启主机才能恢复)。
+ */
+static u8 g_payload[SWLINK_FT_CHUNK + SWLINK_FT_PATH_MAX + 2]
+    __attribute__((aligned(0x1000)));
+
 static bool handleOne(FileSession* s)
 {
     SwlinkFtHeader req;
@@ -274,12 +341,16 @@ static bool handleOne(FileSession* s)
     /* 负载可含路径前缀,故上限放宽到 CHUNK + 路径长度 */
     if (req.magic != SWLINK_FT_MAGIC ||
         req.payload_len > SWLINK_FT_CHUNK + SWLINK_FT_PATH_MAX + 2) {
+        ftLog("FT 请求魔数/长度异常 magic=0x%x plen=%u", req.magic, req.payload_len);
         resp.status = SWLINK_FT_ERR_BAD_REQUEST;
         respond(s, &resp, NULL, 0);
         return true;
     }
+    if (req.payload_len >= 1024)
+        ftLog("FT req cmd=0x%x off=%llu size=%u plen=%u", req.cmd,
+              (unsigned long long)req.offset, req.size, req.payload_len);
 
-    u8* payload = s->buf + sizeof(SwlinkFtHeader);
+    u8* payload = g_payload;
     if (req.payload_len && !readFull(s, payload, req.payload_len))
         return false;
 
