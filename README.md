@@ -74,6 +74,19 @@ open build/SwLink.app    # 双击 App 即可运行,无需命令行
 
 图形界面之外还提供一个命令行工具,共用同一套 USB 协议,适合脚本/批量操作:
 
+**免编译直接用**(macOS x86_64,已内置 libusb,Gatekeeper 首次运行需放行):
+
+```sh
+curl -LO https://raw.githubusercontent.com/xbw12138/SwitchTools/main/dist/swlink-cli-macos-x64.zip
+unzip swlink-cli-macos-x64.zip -d swlink-cli
+xattr -dr com.apple.quarantine swlink-cli
+./swlink-cli/swlink-cli ls /switch
+```
+
+两个文件必须放在同一目录(`swlink-cli` 通过 `@executable_path` 找 `libusb-1.0.0.dylib`)。Apple Silicon 上需已安装 Rosetta。
+
+**从源码构建**:
+
 ```sh
 cd mac && cmake --build build -j        # 产物:mac/build/swlink-cli
 ./build/swlink-cli --help
