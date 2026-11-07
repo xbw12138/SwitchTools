@@ -41,6 +41,15 @@ cd switch && make
 /atmosphere/contents/00FF0000A53B5A57/toolbox.json   <- 复制 switch/toolbox.json
 ```
 
+**不想编译 sysmodule**:直接下载现成的 SD 包,解压到 SD 卡根目录即可,目录结构已建好:
+
+```sh
+curl -LO https://raw.githubusercontent.com/xbw12138/SwitchTools/main/dist/swlink-sysmodule-sd.zip
+unzip swlink-sysmodule-sd.zip -d /Volumes/SWITCH    # 换成你的 SD 卡挂载点
+```
+
+包里含 `atmosphere/contents/00FF0000A53B5A57/{exefs.nsp,toolbox.json,flags/boot2.flag}` 与一份 `README-sysmodule.txt`。
+
 重启主机,或在 Tesla 菜单的 Sysmodules 里启用。
 
 ## 二、macOS 客户端构建

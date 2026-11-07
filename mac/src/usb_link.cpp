@@ -27,7 +27,14 @@ bool UsbLink::open()
     dev_ = libusb_open_device_with_vid_pid(ctx_, SWLINK_USB_VID, SWLINK_USB_PID);
     if (!dev_) {
         snprintf(err_, sizeof(err_),
-                 "未找到 Switch 设备 %04X:%04X(检查 USB 线是否为数据线,以及 sysmodule 是否已启动)",
+                 "未找到 Switch 设备 %04X:%04X\n"
+                 "  1) 确认用的是数据线(不是充电线),且 Switch 已开机\n"
+                 "  2) 确认已安装 SwLink sysmodule:SD:/atmosphere/contents/00FF0000A53B5A57/"
+                 " 下需有 exefs.nsp、toolbox.json、flags/boot2.flag\n"
+                 "  3) 装好后重启主机,或在 Tesla 菜单的 Sysmodules 里启用 SwLink\n"
+                 "  安装包: https://raw.githubusercontent.com/xbw12138/SwitchTools/main/dist/"
+                 "swlink-sysmodule-sd.zip (解压到 SD 卡根目录即可)\n"
+                 "  4) 若 SwLink.app 正在运行,先退出它(USB 接口独占)",
                  SWLINK_USB_VID, SWLINK_USB_PID);
         close();
         return false;
