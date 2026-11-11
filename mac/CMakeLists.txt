@@ -23,6 +23,7 @@ endif()
 add_executable(swlink
     src/main.cpp
     src/usb_link.cpp
+    src/net_link.cpp
     src/stream_client.cpp
     src/video_decoder.cpp
     src/audio_output.cpp

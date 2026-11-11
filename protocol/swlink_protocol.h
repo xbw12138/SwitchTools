@@ -60,6 +60,9 @@ typedef struct {
 
 #define SWLINK_PKT_MAGIC 0x534C5753u /* "SWLS" */
 
+/* 无线心跳:客户端每 2s 发 1 字节,设备端只用于判断对端是否还活着 */
+#define SWLINK_NET_PING 0xA5
+
 typedef enum {
     SwlinkStream_Video = 1,
     SwlinkStream_Audio = 2,
@@ -84,6 +87,25 @@ typedef struct {
 #define SWLINK_AUDIO_CHUNK      0x1000
 #define SWLINK_AUDIO_MAX_BATCH  5
 #define SWLINK_AUDIO_BUF_SIZE   (SWLINK_AUDIO_CHUNK * (1 + SWLINK_AUDIO_MAX_BATCH))
+
+/* ---------------- 无线(局域网 TCP) ----------------
+ * 串流包与握手报文和 USB 完全一致,仅把「端点读写」换成 TCP 字节流。
+ * 设备在 SWLINK_TCP_PORT 上监听,B 端先连接再按 USB 相同的顺序握手。
+ */
+#define SWLINK_TCP_PORT       12345
+#define SWLINK_DISCOVER_PORT  12346
+
+/* UDP 发现:主机向广播地址发 16 字节请求,设备回同样大小的响应。
+ * 响应源 IP 即设备地址,不必在负载里再带一遍。 */
+#define SWLINK_DISCOVER_REQ   "SWLINK-DISCOVER"  /* 15 字符 + NUL */
+#define SWLINK_DISCOVER_RESP  "SWLINK-HERE"      /* 11 字符 + NUL */
+
+typedef struct {
+    char     magic[16];   /* SWLINK_DISCOVER_REQ / SWLINK_DISCOVER_RESP */
+    uint16_t tcp_port;    /* 响应:串流端口(小端) */
+    uint16_t proto_ver;   /* '0','1' 两个 ASCII 字节 */
+    uint32_t reserved;
+} SwlinkDiscoveryMsg;
 
 /* ---------------- 文件传输 ---------------- */
 
@@ -140,9 +162,11 @@ static_assert(sizeof(SwlinkHandshakeRequest) == 16, "handshake request size");
 static_assert(sizeof(SwlinkHandshakeResponse) == 8, "handshake response size");
 static_assert(sizeof(SwlinkStreamHeader) == 18, "stream header size");
 static_assert(sizeof(SwlinkFtHeader) == 40, "ft header size");
+static_assert(sizeof(SwlinkDiscoveryMsg) == 24, "discovery msg size");
 #else
 _Static_assert(sizeof(SwlinkHandshakeRequest) == 16, "handshake request size");
 _Static_assert(sizeof(SwlinkHandshakeResponse) == 8, "handshake response size");
 _Static_assert(sizeof(SwlinkStreamHeader) == 18, "stream header size");
 _Static_assert(sizeof(SwlinkFtHeader) == 40, "ft header size");
+_Static_assert(sizeof(SwlinkDiscoveryMsg) == 24, "discovery msg size");
 #endif

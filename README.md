@@ -1,6 +1,6 @@
 # SwLink
 
-USB 线连接 Switch(大气层 Atmosphere)与 macOS,实现 **游戏画面+音频串流** 和 **SD 卡文件传输**。
+USB 线或同一 Wi-Fi 连接 Switch(大气层 Atmosphere)与 macOS,实现 **游戏画面+音频串流** 和 **SD 卡文件传输**。
 
 全自研两端,不依赖 SysDVR:
 
@@ -9,11 +9,13 @@ USB 线连接 Switch(大气层 Atmosphere)与 macOS,实现 **游戏画面+音频
 │ grc:d ──> capture.c ──> stream_server.c ─┐       │  USB   │  swlink 客户端 │
 │  H.264 720p / PCM 48kHz                  ├─usb:ds├◄══════►│  SDL2+FFmpeg   │
 │ SD 卡 <── fs IPC ── file_server.c ───────┘ 2 接口 │        │  +ImGui       │
+│                                          └─TCP───┼◄─Wi-Fi─►│  (net_link)   │
 └─────────────────────────────────────────────────┘        └───────────────┘
 ```
 
 - **接口 0(串流)**:OUT 握手 / IN 复用视频+音频包流(18B 头 + payload)
 - **接口 1(文件)**:40B 请求/响应头 + payload,8 条命令(PING/LIST/STAT/READ/WRITE/MKDIR/DELETE/RENAME)
+- **无线**:TCP `12345` 复用同一套握手与包格式;UDP `12346` 负责局域网发现,SD 卡文件传输仍走 USB
 - 协议契约见 [protocol/swlink_protocol.h](protocol/swlink_protocol.h),USB VID:PID = `16C0:27DA`
 
 > 只想用、不想看代码?直接看 **[分步使用教程](docs/使用教程.md)**(含"一次成功"检查清单和按现象排错表)。
@@ -69,12 +71,15 @@ open build/SwLink.app    # 双击 App 即可运行,无需命令行
 
 ## 三、使用
 
-1. Switch 开机(确保 SwLink sysmodule 已启动);USB 线连 Mac
-2. 打开 SwLink.app,点 **连接 Switch**
+1. Switch 开机(确保 SwLink sysmodule 已启动)
+2. 连接方式二选一:
+   - **USB**:USB 线连 Mac,点 **USB 连接**
+   - **Wi-Fi**:Switch 与 Mac 连同一个 Wi-Fi,点 **无线连接**,选自动发现的设备(或手填 IP)后连接;
+     全程无需插线,建议 5GHz
 3. 进游戏即出画面和声音;「独立窗口」可把纯画面弹到单独窗口(可缩放到副屏/外接屏),
    打开后主窗口停止渲染画面
 4. 「SD 卡文件」页可浏览 SD 卡、多选/递归下载、上传(支持整目录拖入)、新建/重命名/批量删除;
-   点表头排序,传输中显示速度、剩余时间并可取消,底部显示 SD 剩余容量
+   点表头排序,传输中显示速度、剩余时间并可取消,底部显示 SD 剩余容量(文件功能仅 USB 模式可用)
 5. 把本地文件或文件夹直接拖进窗口,即可上传到当前目录
 6. 「NRO 推送」页把本地 `.nro` 经 USB 写入 SD 卡(默认 `switch/`),之后在 Switch 上
    按住 R 启动 hbmenu,进 `switch` 目录点选即可运行
@@ -115,6 +120,8 @@ cd mac && cmake --build build -j        # 产物:mac/build/swlink-cli
 
 - **只有支持系统录屏(长按截图键)的游戏才能采集**。不支持的游戏和主菜单 `grc:d` 会无限阻塞(无画面,属正常现象)。建议安装 [dvr-patches](https://github.com/exelix11/dvr-patches) 解锁全部游戏
 - **不要与 SysDVR 同时运行**:usb:ds 为独占设备,两个 sysmodule 会冲突
+- **无线串流**:720p30 码流约 4–10 Mbps,5GHz 稳定;2.4GHz 或信号差时可能掉帧/重连。
+  主机会在链路中断后提示断开,重新点连接即可;无线模式不支持 SD 卡文件传输
 - 视频为 grc 硬编 720p H.264,延迟比 RTSP/网络方案略低但不等于零
 - 文件传输走文件接口,与串流互不阻塞;大文件按 512KB 分块
 - **换另一台 Switch**:固件同为 18.1.0 时直接复制 SD 卡上的 3 个文件即可;固件版本不同需按该版本同期 libnx 重编(否则模块静默不加载),详见[教程 2.2 节](docs/使用教程.md)
@@ -127,13 +134,15 @@ protocol/swlink_protocol.h   两端唯一协议契约
 switch/                      sysmodule(devkitPro 工程)
   source/usb_link.c          usb:ds 双接口初始化与端点读写
   source/capture.c           grc:d 采集(H.264+PCM,SPS/PPS 注入)
-  source/stream_server.c     握手 + 流发送(视频 main 线程,音频独立线程)
+  source/stream_server.c     握手 + 流发送(视频 main 线程,音频独立线程,USB/TCP 共用)
+  source/net_server.c        无线接入:TCP 串流监听 + UDP 设备发现
   source/file_server.c       SD 卡文件服务(原生 fs IPC,无堆)
   source/main.c              入口,2MB 静态堆,拉起各线程
   Makefile / swlink.json     构建配置(title id 00FF0000A53B5A57)
 mac/                         macOS 客户端(CMake 工程)
   src/link.hpp               传输层抽象接口(StreamClient/FileClient 只依赖它)
   src/usb_link.cpp           libusb 连接/握手/端点读写
+  src/net_link.cpp           Wi-Fi:TCP 连接、局域网发现,复用同一套包协议
   src/stream_client.cpp      流拆包线程
   src/video_decoder.cpp      FFmpeg H.264 解码 -> SDL YUV 纹理
   src/audio_output.cpp       SDL 音频队列(积压 0.5s 丢旧,支持静音)

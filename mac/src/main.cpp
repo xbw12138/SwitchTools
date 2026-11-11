@@ -30,6 +30,7 @@
 
 #include "link.hpp"
 #include "usb_link.hpp"
+#include "net_link.hpp"
 #include "stream_client.hpp"
 #include "video_decoder.hpp"
 #include "audio_output.hpp"
@@ -52,7 +53,9 @@
 
 /* ---------------- 全局状态 ---------------- */
 static UsbLink g_usbLink;
+static NetLink g_netLink;
 static Link* g_link = &g_usbLink;
+static bool g_useWifi = false;
 static StreamClient* g_stream = nullptr;
 static VideoDecoder g_decoder;
 static AudioOutput g_audio;
@@ -67,6 +70,14 @@ static std::string g_status = "未连接";
 /* 错误信息可能由后台线程写入,加锁保护 */
 static std::mutex g_errMutex;
 static std::string g_errorText;
+
+/* Wi-Fi 连接面板 */
+static char g_wifiIp[64] = "";
+static int g_wifiPort = SWLINK_TCP_PORT;
+static bool g_wifiPopup = false;
+static std::vector<NetDevice> g_wifiDevices;
+static std::mutex g_wifiDevMutex;
+static std::atomic<bool> g_wifiScanning{false};
 
 /* NRO 推送:本地 .nro 经 USB 文件通道写入 Switch 的 SD 卡 */
 static char g_nxNroPath[512] = "";
@@ -138,7 +149,9 @@ static void clearError()
    缺字会渲染成方块,因此把界面实际出现的汉字补进字形范围 */
 static const char kUiCjk[] =
     "一上下不与两个中串为主乱了交产人以件任优会传位住体余作使侧便保信停先免入全共关内再写出击分切列创初删到制刷前剩功加务动助包化匹区协单卡即压原双取口只可台右同名后否含启命和响器固图在地址型塞填声处备复多大失头夹始字存安完定客容小尚局层屏屑展属工左已带帧帮常并序底度延建开归当录影径待忽态总息慎戏成或截户手才打执找把折护拖持指按换据排接提搜操支改数文断新无旧时是有未本机材束条板染查标栏样根检次正此每气没法流浏消渲游滤灯点版状率现理生用由画界留略的目直码硬确示秒称程稍空窗立端等管类系索级纸线终结绘给统编置能自致色节若菜行表装要视览角解计认让议设误请读调谨象败质跨路载输边过运进远连迟选递通速避部配采里重量钮锁错锚键长间阻除集需静面音页顶项顺顿预频题首独闭显回"
-    "域网搜索中填再使没鉴权络抖丢来花睡眠";
+    "域网搜索中填再使没鉴权络抖丢来花睡眠"
+    "无线连接同一正在局域网设备未发现可手动填写端口重新取消暂请确认格式无效"
+    "模式支持";
 
 static void loadFonts()
 {
@@ -271,11 +284,31 @@ static std::string ftStatus()
 
 /* ---------------- 连接管理 ---------------- */
 
-static bool connectDevice()
+static void startWifiScan()
+{
+    if (g_wifiScanning.exchange(true))
+        return;
+
+    std::thread([]() {
+        std::vector<NetDevice> found = netDiscover(1500);
+        {
+            std::lock_guard<std::mutex> lk(g_wifiDevMutex);
+            g_wifiDevices = std::move(found);
+        }
+        g_wifiScanning = false;
+    }).detach();
+}
+
+static bool connectDevice(bool wifi = false)
 {
     clearError();
 
-    g_link = &g_usbLink;
+    if (wifi) {
+        g_netLink.setEndpoint(g_wifiIp, (uint16_t)(g_wifiPort > 0 ? g_wifiPort : SWLINK_TCP_PORT));
+        g_link = &g_netLink;
+    } else {
+        g_link = &g_usbLink;
+    }
 
     if (!g_link->open()) { setError(g_link->lastError()); return false; }
     if (!g_link->handshake(true, true, 3)) {
@@ -283,16 +316,18 @@ static bool connectDevice()
         g_link->close();
         return false;
     }
+    g_useWifi = wifi;
 
     if (!g_decoder.init()) { setError("解码器初始化失败"); g_link->close(); return false; }
     if (!g_audio.init())   { /* 音频失败不致命 */ }
     g_audio.setMuted(g_muted);
 
-    g_files = new FileClient(*g_link);
-    g_files->setCancelFlag(&g_ftCancel);
+    g_files = g_link->supportsFileTransfer() ? new FileClient(*g_link) : nullptr;
+    if (g_files)
+        g_files->setCancelFlag(&g_ftCancel);
     g_ftCancel = false;
     g_connected = true;
-    g_status = "已连接,串流中";
+    g_status = wifi ? "已连接,无线串流中" : "已连接,串流中";
     g_filesLoaded = false;   /* 首次进文件页时自动列根目录 */
 
     g_stream = new StreamClient(*g_link);
@@ -315,6 +350,7 @@ static void disconnectDevice()
     delete g_files; g_files = nullptr;
     g_link->close();
     g_connected = false;
+    g_useWifi = false;
     g_status = "未连接";
     g_entries.clear();
     g_view.clear();
@@ -494,6 +530,88 @@ static std::string expandHome(const std::string& p)
     return std::string(home) + p.substr(1);
 }
 
+/* ---------------- 无线连接面板 ---------------- */
+
+static void drawWifiPopup()
+{
+    if (!g_wifiPopup)
+        return;
+
+    ImGui::SetNextWindowSize(ImVec2(460, 0), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("无线连接###wifi_popup", &g_wifiPopup,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        g_wifiPopup = false;
+        return;
+    }
+
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_TEXT_DIM),
+                       "Switch 与 Mac 需要连接同一个 Wi-Fi。");
+    ImGui::Spacing();
+
+    ImGui::SetNextItemWidth(220);
+    ImGui::InputTextWithHint("##wifiip", "Switch IP,如 192.168.1.20",
+                             g_wifiIp, sizeof(g_wifiIp));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90);
+    ImGui::InputInt("##wifiport", &g_wifiPort, 0, 0);
+    ImGui::SameLine();
+    ImGui::TextDisabled("端口");
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    std::vector<NetDevice> devs;
+    {
+        std::lock_guard<std::mutex> lk(g_wifiDevMutex);
+        devs = g_wifiDevices;
+    }
+
+    if (g_wifiIp[0] == 0 && !devs.empty()) {
+        snprintf(g_wifiIp, sizeof(g_wifiIp), "%s", devs[0].ip.c_str());
+        g_wifiPort = devs[0].port;
+    }
+
+    if (g_wifiScanning.load())
+        ImGui::TextDisabled("正在搜索局域网设备...");
+    else if (devs.empty())
+        ImGui::TextDisabled("未发现设备,可手动填写 IP 后连接");
+    else
+        ImGui::TextDisabled("发现 %d 台设备,点击选择:", (int)devs.size());
+
+    for (const auto& d : devs) {
+        char label[96];
+        snprintf(label, sizeof(label), "%s:%u", d.ip.c_str(), (unsigned)d.port);
+        if (ImGui::Selectable(label, g_wifiIp == d.ip)) {
+            snprintf(g_wifiIp, sizeof(g_wifiIp), "%s", d.ip.c_str());
+            g_wifiPort = d.port;
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::BeginDisabled(g_wifiScanning.load());
+    if (ImGui::Button("重新搜索", ImVec2(120, 32)))
+        startWifiScan();
+    ImGui::EndDisabled();
+
+    ImGui::SameLine();
+    ImGui::BeginDisabled(g_wifiIp[0] == 0);
+    if (ImGui::Button("连接", ImVec2(120, 32))) {
+        g_wifiPopup = false;
+        ImGui::CloseCurrentPopup();
+        connectDevice(true);
+    }
+    ImGui::EndDisabled();
+
+    ImGui::SameLine();
+    if (ImGui::Button("取消", ImVec2(120, 32))) {
+        g_wifiPopup = false;
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::EndPopup();
+}
+
 /* ---------------- 顶部栏 ---------------- */
 
 static void drawTopBar()
@@ -517,16 +635,17 @@ static void drawTopBar()
                 "Switch 串流 / 文件传输");
 
     /* 右侧:状态灯 + 状态文字 + 连接按钮 */
-    const float btnW = 116.0f, btnH = 36.0f;
-    const ImVec2 btnPos(p.x + w - 24 - btnW, p.y + (h - btnH) * 0.5f);
+    const float btnW = 104.0f, btnH = 36.0f, btnGap = 8.0f;
+    const float btnGroupW = btnW * 2 + btnGap;
+    const ImVec2 btnPos(p.x + w - 24 - btnGroupW, p.y + (h - btnH) * 0.5f);
 
     const std::string err = errorText();
     const char* st = g_connected ? "已连接" : (err.empty() ? "未连接" : "连接失败");
     const float stW = ImGui::CalcTextSize(st).x;
     const ImVec2 stPos(btnPos.x - 30 - stW, p.y + h * 0.5f - ImGui::GetTextLineHeight() * 0.5f);
 
-    /* 通道信息:USB */
-    const char* chanInfo = g_connected ? "USB" : "";
+    /* 通道信息:USB / Wi-Fi */
+    const char* chanInfo = g_connected ? (g_useWifi ? "Wi-Fi" : "USB") : "";
     if (g_connected) {
         const float infoW = ImGui::CalcTextSize(chanInfo).x;
         dl->AddText(ImVec2(stPos.x - 26.0f - infoW, stPos.y), COL_TEXT_DIM, chanInfo);
@@ -542,17 +661,31 @@ static void drawTopBar()
     if (g_connected) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.24f, 0.28f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.25f, 0.27f, 1.0f));
-        if (ImGui::Button("断开", ImVec2(btnW, btnH))) disconnectDevice();
+        if (ImGui::Button("断开", ImVec2(btnGroupW, btnH))) disconnectDevice();
         ImGui::PopStyleColor(2);
     } else {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.23f, 0.29f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.30f, 0.38f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.30f, 0.34f, 0.42f, 1.0f));
+        if (ImGui::Button("USB 连接", ImVec2(btnW, btnH)))
+            connectDevice(false);
+        ImGui::PopStyleColor(3);
+
+        ImGui::SameLine(0, btnGap);
+
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.45f, 0.90f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.32f, 0.52f, 0.98f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.22f, 0.40f, 0.80f, 1.0f));
-        if (ImGui::Button("连接 Switch", ImVec2(btnW, btnH)))
-            connectDevice();
+        if (ImGui::Button("无线连接", ImVec2(btnW, btnH))) {
+            g_wifiPopup = true;
+            ImGui::OpenPopup("无线连接###wifi_popup");
+            startWifiScan();
+        }
         ImGui::PopStyleColor(3);
     }
     ImGui::EndDisabled();
+
+    drawWifiPopup();
 
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
 }
@@ -1210,7 +1343,9 @@ static void drawFilePage()
 {
     if (!g_connected || !g_files) {
         const ImVec2 avail = ImGui::GetContentRegionAvail();
-        const char* msg = "尚未连接,请先连接 Switch";
+        const char* msg = !g_connected
+                              ? "尚未连接,请先连接 Switch"
+                              : "Wi-Fi 模式暂不支持 SD 卡文件传输,请用 USB 连接";
         const float w = ImGui::CalcTextSize(msg).x;
         ImGui::SetCursorPos(ImVec2((avail.x - w) * 0.5f, avail.y * 0.45f));
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_TEXT_FAINT), "%s", msg);

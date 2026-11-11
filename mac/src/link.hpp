@@ -23,5 +23,8 @@ public:
     virtual int fileReadSome(void* data, int maxLen, unsigned timeoutMs) = 0;
     virtual bool fileWrite(const void* data, int len, unsigned timeoutMs) = 0;
 
+    /* 无线链路暂不提供 SD 卡文件通道,UI 据此隐藏文件相关操作 */
+    virtual bool supportsFileTransfer() const { return true; }
+
     virtual const char* lastError() const = 0;
 };

@@ -28,9 +28,11 @@
     <string>public.app-category.utilities</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>SwLink 需要访问局域网,以便通过 Wi-Fi 发现并连接 Switch。</string>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>SwLink · USB 串流与文件传输</string>
+    <string>SwLink · USB / 无线串流与文件传输</string>
 </dict>
 </plist>
