@@ -22,6 +22,25 @@ static bool g_initialized = false;
 static UsbCommsInterface g_interfaces[USB_NUM_INTERFACES];
 static RwLock g_global_lock;
 
+/* 全局 I/O 闸门:重建 usb:ds 前必须排空所有在途端点操作 */
+static RwLock g_ioGate;
+static bool g_ioGateReady = false;
+
+/* 掉线检测状态:曾经 Configured 过、以及从何时开始掉出 Configured */
+static bool g_wasConfigured = false;
+static bool g_needRecovery = false;
+static u64 g_lostSinceTick = 0;
+static u32 g_flakyFailCount = 0;
+static volatile Result g_lastUsbError = 0;
+
+Result swlinkUsbLastError(void)
+{
+    return g_lastUsbError;
+}
+
+extern void sdLog(const char* text);
+extern void sdLogRc(const char* tag, Result rc);
+
 /* PostBufferAsync 要求 0x1000 对齐,非对齐数据经这些中转 buffer */
 static alignas(0x1000) u8 g_ep_in_buf[USB_NUM_INTERFACES][0x1000];
 static alignas(0x1000) u8 g_ep_out_buf[USB_NUM_INTERFACES][0x1000];
@@ -73,9 +92,11 @@ static Result _interfaceInit5x(u32 intf_ind)
     rc = usbDsRegisterInterface(&interface->interface);
     if (R_FAILED(rc)) return rc;
 
-    interface_descriptor.bInterfaceNumber = interface->interface->interface_index;
-    endpoint_descriptor_in.bEndpointAddress += interface_descriptor.bInterfaceNumber + 1;
-    endpoint_descriptor_out.bEndpointAddress += interface_descriptor.bInterfaceNumber + 1;
+    /* 接口号与端点地址必须固定:重建 usb:ds 时 usbDsRegisterInterface 返回的
+       interface_index 会不断累加,若跟着它走,重插后 Mac 端按原编号读写会全部落空 */
+    interface_descriptor.bInterfaceNumber = (u8)intf_ind;
+    endpoint_descriptor_in.bEndpointAddress = USB_ENDPOINT_IN | (u8)(intf_ind * 2 + 1);
+    endpoint_descriptor_out.bEndpointAddress = (u8)(intf_ind * 2 + 2);
 
     /* Full Speed (USB 1.1) */
     rc = usbDsInterface_AppendConfigurationData(interface->interface, UsbDeviceSpeed_Full, &interface_descriptor, USB_DT_INTERFACE_SIZE);
@@ -123,6 +144,11 @@ Result swlinkUsbInitialize(void)
 {
     Result rc = 0;
     rwlockWriteLock(&g_global_lock);
+
+    if (!g_ioGateReady) {
+        rwlockInit(&g_ioGate);
+        g_ioGateReady = true;
+    }
 
     if (g_initialized) {
         rwlockWriteUnlock(&g_global_lock);
@@ -203,7 +229,9 @@ void swlinkUsbExit(void)
 
     for (u32 i = 0; i < USB_NUM_INTERFACES; i++) {
         UsbCommsInterface* interface = &g_interfaces[i];
-        usbDsInterface_Close(interface->interface);
+        /* 初始化中途失败时 interface 可能还是 NULL,不能直接交给 libnx */
+        if (interface->interface)
+            usbDsInterface_Close(interface->interface);
         interface->initialized = false;
         interface->endpoint_in = NULL;
         interface->endpoint_out = NULL;
@@ -345,10 +373,13 @@ size_t swlinkUsbRead(u32 interface, void* buffer, size_t size, u64 timeout)
     if (interface >= USB_NUM_INTERFACES) return 0;
     inter = &g_interfaces[interface];
 
+    rwlockReadLock(&g_ioGate);
+
     rwlockReadLock(&inter->lock);
     initialized = inter->initialized;
     rwlockReadUnlock(&inter->lock);
-    if (!initialized) return 0;
+    if (!initialized)
+        goto out;
 
     rwlockWriteLock(&inter->lock_out);
     rc = _read(inter, g_ep_out_buf[interface], buffer, size, &transferredSize, timeout);
@@ -363,6 +394,9 @@ size_t swlinkUsbRead(u32 interface, void* buffer, size_t size, u64 timeout)
             rwlockWriteUnlock(&inter->lock_out);
         }
     }
+
+out:
+    rwlockReadUnlock(&g_ioGate);
     return transferredSize;
 }
 
@@ -377,10 +411,15 @@ size_t swlinkUsbWrite(u32 interface, const void* buffer, size_t size, u64 timeou
     if (interface >= USB_NUM_INTERFACES) return 0;
     inter = &g_interfaces[interface];
 
+    rwlockReadLock(&g_ioGate);
+
     rwlockReadLock(&inter->lock);
     initialized = inter->initialized;
     rwlockReadUnlock(&inter->lock);
-    if (!initialized) return 0;
+    if (!initialized) {
+        g_lastUsbError = MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+        goto out;
+    }
 
     rwlockWriteLock(&inter->lock_in);
     rc = _write(inter, g_ep_in_buf[interface], buffer, size, &transferredSize, timeout);
@@ -394,5 +433,124 @@ size_t swlinkUsbWrite(u32 interface, const void* buffer, size_t size, u64 timeou
             rwlockWriteUnlock(&inter->lock_in);
         }
     }
+
+    g_lastUsbError = rc;
+    if (R_SUCCEEDED(rc) && transferredSize == 0)
+        g_lastUsbError = KernelError_TimedOut;
+
+out:
+    rwlockReadUnlock(&g_ioGate);
     return transferredSize;
+}
+
+/* 完整重建 usb:ds:等同于重启 sysmodule 后的状态 */
+static Result swlinkUsbReinitialize(void)
+{
+    Result rc = MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+
+    /* 写锁排空两个线程在途的端点操作,再动手关闭接口 */
+    rwlockWriteLock(&g_ioGate);
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        swlinkUsbExit();
+        rc = swlinkUsbInitialize();
+        if (R_SUCCEEDED(rc))
+            break;
+        svcSleepThread(3E+8);
+    }
+
+    rwlockWriteUnlock(&g_ioGate);
+    return rc;
+}
+
+/* 重建完成后复位配置状态,但保留恢复需求:断开期间周期性重建直到重新接入 */
+static void swlinkUsbRebuild(const char* why)
+{
+    g_lostSinceTick = armGetSystemTick();
+    g_wasConfigured = false;
+    g_flakyFailCount = 0;
+
+    sdLog(why);
+    sdLogRc("usb 重建", swlinkUsbReinitialize());
+}
+
+bool swlinkUsbRecoverIfLost(void)
+{
+    static u32 lastLoggedState = 0xFFFFFFFF;
+    u32 state = 0;
+    u64 now;
+    u64 elapsed;
+
+    if (!g_ioGateReady || !g_initialized)
+        return false;
+
+    if (R_FAILED(usbDsGetState(&state)))
+        return false;
+
+    now = armGetSystemTick();
+
+    if (state != lastLoggedState) {
+        lastLoggedState = state;
+        sdLogRc("usb 状态", state);
+    }
+
+    if (state == UsbState_Configured) {
+        if (!g_wasConfigured && g_needRecovery)
+            sdLog("USB 主机已重新接入");
+        g_wasConfigured = true;
+        g_needRecovery = false;
+        g_lostSinceTick = 0;
+        g_flakyFailCount = 0;
+        return false;
+    }
+
+    /* 开机后还没连过主机: 正常待机, 不做任何事 */
+    if (!g_wasConfigured && !g_needRecovery)
+        return false;
+
+    if (g_lostSinceTick == 0) {
+        g_lostSinceTick = now;
+        sdLog("USB 主机已断开, 等待重新接入");
+        return false;
+    }
+
+    elapsed = armTicksToNs(now - g_lostSinceTick);
+    if (elapsed < 5000000000ULL)
+        return false;
+
+    /* 断开期间每 5 秒重建一次:新会话更可能接住下一次插入的枚举 */
+    swlinkUsbRebuild("USB 未重新接入, 重试重建 usb:ds");
+    return true;
+}
+
+void swlinkUsbNoteLinkLost(void)
+{
+    u32 state = 0;
+
+    if (!g_ioGateReady || !g_initialized)
+        return;
+
+    /* 给 usb:ds 一点时间把状态切换成非 Configured */
+    svcSleepThread(2E+8);
+
+    if (R_FAILED(usbDsGetState(&state)))
+        return;
+
+    if (state != UsbState_Configured) {
+        /* 已掉出 Configured:交给 RecoverIfLost 周期性重建 */
+        if (g_wasConfigured) {
+            g_needRecovery = true;
+            if (g_lostSinceTick == 0) {
+                g_lostSinceTick = armGetSystemTick();
+                sdLog("USB 主机已断开, 等待重新接入");
+            }
+        }
+        return;
+    }
+
+    /* 状态仍是 Configured 但连续写失败: 怀疑端点卡死, 累计 3 次后重建 */
+    if (++g_flakyFailCount >= 3) {
+        g_needRecovery = true;
+        swlinkUsbRebuild("USB 端点无响应, 重建 usb:ds");
+    }
 }

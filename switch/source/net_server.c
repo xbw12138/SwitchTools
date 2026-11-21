@@ -240,6 +240,12 @@ static void senderThread(void* arg)
 
     sdLog("无线发送线程已进入");
 
+    /* 会话活性:客户端每 2s 发 1 字节心跳,超时未收到就主动回收,
+       避免客户端异常退出后旧会话一直占着 fd。 */
+    const u64 tickFreq = armGetSystemTickFreq();
+    const u64 idleLimit = tickFreq * 10;   /* 10s 无心跳判死 */
+    u64 lastActive = armGetSystemTick();
+
     while (g_netRunning) {
         bool wantVideo = false;
         bool wantAudio = false;
@@ -251,6 +257,7 @@ static void senderThread(void* arg)
             streamServerDetachNet(-1);
             if (streamServerAttachNet(pending, wantVideo, wantAudio, batching)) {
                 sdLog("无线会话已接管,开始串流");
+                lastActive = armGetSystemTick();
             } else {
                 sdLog("无线会话接管失败");
                 close(pending);
@@ -264,6 +271,20 @@ static void senderThread(void* arg)
             continue;
         }
 
+        int r = streamServerNetRead(fd);
+        if (r < 0) {
+            sdLog("无线会话已关闭, 等待重连");
+            streamServerDetachNet(-1);
+            continue;
+        }
+        if (r > 0)
+            lastActive = armGetSystemTick();
+        else if (armGetSystemTick() - lastActive > idleLimit) {
+            sdLog("无线会话心跳超时, 断开");
+            streamServerDetachNet(-1);
+            continue;
+        }
+
         if (streamServerNetPending()) {
             if (!streamServerNetFlush(fd)) {
                 sdLog("无线发送失败, 断开");
@@ -272,7 +293,7 @@ static void senderThread(void* arg)
                 svcSleepThread(1E+6L);
             }
         } else {
-            /* 没有数据要发时短暂让出 CPU;对端断开由发送失败检测 */
+            /* 没有数据要发时短暂让出 CPU;对端断开由心跳检测 */
             svcSleepThread(2E+6L);
         }
     }

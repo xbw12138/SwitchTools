@@ -21,8 +21,9 @@ public:
     bool init();
     void shutdown();
 
-    /* 流线程调用:喂一个 Annex-B NAL(可含 SPS/PPS 前缀) */
-    void feed(const uint8_t* data, size_t len);
+    /* 流线程调用:喂一个 Annex-B NAL(可含 SPS/PPS 前缀)
+       flags 带 SWLINK_STREAM_FLAG_SPSPPS 时先清空解码器状态,保证断流后可恢复 */
+    void feed(const uint8_t* data, size_t len, uint8_t flags = 0);
 
     /* UI 线程调用:有新帧则更新纹理;返回可渲染纹理(可能为 nullptr) */
     SDL_Texture* uploadIfDirty(SDL_Renderer* renderer);

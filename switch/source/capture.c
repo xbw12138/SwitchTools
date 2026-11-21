@@ -190,6 +190,19 @@ bool captureReadVideo(void)
     return true;
 }
 
+bool captureVideoIsKeyframe(void)
+{
+    const u8* p = VPkt.data;
+
+    if (VPkt.header.flags & SWLINK_STREAM_FLAG_ERROR)
+        return false;
+    if (VPkt.header.flags & SWLINK_STREAM_FLAG_SPSPPS)
+        p += sizeof(SPS) + sizeof(PPS);
+    if (VPkt.header.data_size <= (u32)(p - VPkt.data) + 4)
+        return false;
+    return (p[4] & 0x1F) == 5;
+}
+
 bool captureReadAudio(void)
 {
     u32 dataSize = 0;

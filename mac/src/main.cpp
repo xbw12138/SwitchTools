@@ -67,6 +67,11 @@ static float g_pixelScale = 1.0f;
 static std::atomic<bool> g_connected{false};
 static std::string g_status = "未连接";
 
+/* 无线断线自动重连:只在 Wi-Fi 模式生效,退避 2/4/8/10 秒 */
+static std::atomic<bool> g_autoReconnect{false};
+static std::atomic<int> g_reconnectTries{0};
+static Uint32 g_reconnectAt = 0;
+
 /* 错误信息可能由后台线程写入,加锁保护 */
 static std::mutex g_errMutex;
 static std::string g_errorText;
@@ -327,18 +332,29 @@ static bool connectDevice(bool wifi = false)
         g_files->setCancelFlag(&g_ftCancel);
     g_ftCancel = false;
     g_connected = true;
+    g_autoReconnect = false;
+    g_reconnectTries = 0;
     g_status = wifi ? "已连接,无线串流中" : "已连接,串流中";
     g_filesLoaded = false;   /* 首次进文件页时自动列根目录 */
 
     g_stream = new StreamClient(*g_link);
     g_stream->start(
-        [](const uint8_t* d, uint32_t l, uint8_t) { g_decoder.feed(d, l); },
+        [](const uint8_t* d, uint32_t l, uint8_t f) { g_decoder.feed(d, l, f); },
         [](const uint8_t* d, uint32_t l) { g_audio.queue(d, l); },
-        []() { g_connected = false; g_status = "连接已断开"; });
+        []() {
+            g_connected = false;
+            if (g_useWifi) {
+                g_status = "连接中断,正在重连…";
+                g_autoReconnect = true;
+            } else {
+                g_status = "连接已断开";
+            }
+        });
     return true;
 }
 
-static void disconnectDevice()
+/* 只拆掉会话相关对象,保留界面状态(用于断线重连) */
+static void teardownSession()
 {
     if (g_stream) {
         g_stream->stop();
@@ -349,6 +365,13 @@ static void disconnectDevice()
     g_decoder.shutdown();
     delete g_files; g_files = nullptr;
     g_link->close();
+}
+
+static void disconnectDevice()
+{
+    teardownSession();
+    g_autoReconnect = false;
+    g_reconnectTries = 0;
     g_connected = false;
     g_useWifi = false;
     g_status = "未连接";
@@ -1871,6 +1894,24 @@ int main(int, char**)
                 ev.window.event == SDL_WINDOWEVENT_CLOSE &&
                 g_vwin && ev.window.windowID == SDL_GetWindowID(g_vwin))
                 closeVideoWindow();
+        }
+
+        /* 无线断线自动重连:退避 2/4/8/10 秒,用户主动断开则不重连 */
+        if (g_autoReconnect.load() && !g_connected.load()) {
+            const Uint32 now = SDL_GetTicks();
+            if (now >= g_reconnectAt) {
+                g_autoReconnect = false;
+                teardownSession();
+                if (connectDevice(true)) {
+                    g_reconnectTries = 0;
+                } else {
+                    const int tries = ++g_reconnectTries;
+                    const Uint32 backoff = (tries >= 4) ? 10u : (1u << tries);
+                    g_reconnectAt = SDL_GetTicks() + backoff * 1000u;
+                    g_autoReconnect = true;
+                    g_status = "重连中…";
+                }
+            }
         }
 
         /* 每秒统计一次解码帧率 */

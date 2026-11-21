@@ -26,3 +26,19 @@ size_t swlinkUsbRead(u32 interface, void* buffer, size_t size, u64 timeout);
 
 /* 向指定接口的 IN 端点写入,返回实际写入字节数 */
 size_t swlinkUsbWrite(u32 interface, const void* buffer, size_t size, u64 timeout);
+
+/* 最近一次 swlinkUsbWrite 的内部错误码(0 表示成功),用于排查握手失败 */
+Result swlinkUsbLastError(void);
+
+/*
+ * 监测主机是否已断开:掉出 Configured 后先给 8 秒等待主机重新枚举,
+ * 超时才重建 usb:ds(重建后端点恢复可用)。
+ * 返回 true 表示刚刚完成重建,调用方应重新发起收发。
+ */
+bool swlinkUsbRecoverIfLost(void);
+
+/*
+ * 串流刚写失败时调用:若已掉出 Configured 只记录掉线时间,交给上面的 8 秒窗口;
+ * 若仍在 Configured 但连续 3 次写失败,判定端点卡死并重建。
+ */
+void swlinkUsbNoteLinkLost(void);

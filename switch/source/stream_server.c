@@ -38,6 +38,10 @@ static size_t netTxLen = 0;    /* 队列中的有效字节数 */
 static size_t netTxSent = 0;   /* 已发出的字节数 */
 static unsigned netDropped = 0;
 
+/* 视频丢过包(队列满)后置位,直到重新从 IDR 起送。
+   只在视频线程内读写,不需要加锁。 */
+static bool videoResync = false;
+
 /* 握手完成、等待发送线程接管的新会话。
    用单个原子槽位传递,发送线程在空闲路径上不碰任何互斥锁。 */
 static volatile u64 pendingSlot = 0;
@@ -218,6 +222,17 @@ bool streamServerNetFlush(int fd)
             return true;
     }
 
+    /* 先探一次可写再 send。Horizon 上 fcntl 设非阻塞不可靠,
+       这样即使 socket 仍是阻塞模式,也不会在弱网时卡住发送线程。 */
+    {
+        struct pollfd po = { fd, POLLOUT, 0 };
+        int pr = poll(&po, 1, 0);
+        if (pr == 0)
+            return true;
+        if (pr < 0 && errno != EINTR)
+            return false;
+    }
+
     ssize_t n = send(fd, netChunk + chunkSent, chunkLen - chunkSent, 0);
     if (n > 0) {
         chunkSent += (size_t)n;
@@ -239,23 +254,37 @@ bool streamServerNetFlush(int fd)
     return false;
 }
 
-/* 读取客户端发来的心跳;返回 false 表示连接已关闭 */
-bool streamServerNetRead(int fd)
+/* 读取客户端心跳。1 = 收到数据,0 = 暂无数据,-1 = 连接已关闭。
+   用 poll 先探可读,避免在 MSG_DONTWAIT/阻塞语义不确定时卡住会话线程。 */
+int streamServerNetRead(int fd)
 {
     char buf[64];
-    ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+
+    struct pollfd pi = { fd, POLLIN, 0 };
+    int pr = poll(&pi, 1, 0);
+    if (pr == 0)
+        return 0;
+    if (pr < 0)
+        return errno == EINTR ? 0 : -1;
+
+    ssize_t n = recv(fd, buf, sizeof(buf), 0);
     if (n > 0)
-        return true;
+        return 1;
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
-        return true;
-    return false;
+        return 0;
+    return -1;
 }
 
-/* 调用方必须持有 queueMutex */
-static bool netEnqueueLocked(const void* data, size_t length)
+/* 调用方必须持有 queueMutex。
+   返回 false 表示这个视频包被丢弃,调用方应置位重同步标志。
+   音频在队列过半时直接丢弃:拥塞时宁可静音,也不让它拖住视频。 */
+static bool netEnqueueLocked(const void* data, size_t length, bool isVideo)
 {
     if (length == 0 || length > NET_TX_BUF_SIZE)
         return false;
+
+    if (!isVideo && netTxLen - netTxSent > NET_TX_BUF_SIZE / 2)
+        return true;
 
     if (netTxSent == netTxLen) {
         netTxSent = 0;
@@ -270,8 +299,7 @@ static bool netEnqueueLocked(const void* data, size_t length)
     if (NET_TX_BUF_SIZE - netTxLen < length) {
         if (netDropped++ == 0)
             sdLog("无线发送队列满, 开始丢包");
-        /* 丢弃但返回成功:采集线程不应因为网络拥塞而退避或重试 */
-        return true;
+        return false;
     }
 
     memcpy(netTxBuf + netTxLen, data, length);
@@ -329,17 +357,22 @@ static void usbResetQueue(void)
 
 static bool sendPacket(const void* data, size_t length)
 {
+    const SwlinkStreamHeader* hdr = (const SwlinkStreamHeader*)data;
+    const bool isVideo = hdr->type == SwlinkStream_Video;
+
     if (netFdPub >= 0) {
         bool success;
 
         mutexLock(&queueMutex);
-        success = netFd >= 0 ? netEnqueueLocked(data, length) : false;
+        success = netFd >= 0 ? netEnqueueLocked(data, length, isVideo) : false;
         mutexUnlock(&queueMutex);
         return success;
     }
 
-    if (videoConnected || audioConnected)
+    if (videoConnected || audioConnected) {
+        /* USB 队列满同样返回失败,视频线程据此从关键帧重新对齐 */
         return usbEnqueue(data, length);
+    }
 
     return false;
 }
@@ -358,15 +391,29 @@ static bool handshake(void)
     SwlinkHandshakeRequest req;
 
     size_t num = 0;
+    u64 nextLogTick = 0;
     do {
+        /* 主机拔线后 usb:ds 端点会失效,检测到掉线就重建,否则再插线也收不到 HELLO */
+        if (swlinkUsbRecoverIfLost())
+            continue;
         num = swlinkUsbWrite(USB_INTF_STREAM, SWLINK_HELLO, sizeof(SWLINK_HELLO), HANDSHAKE_TIMEOUT);
+        if (num == 0) {
+            u64 now = armGetSystemTick();
+            if (nextLogTick == 0 || now >= nextLogTick) {
+                nextLogTick = now + armNsToTicks(2000000000ULL);
+                sdLogRc("HELLO 发送失败", swlinkUsbLastError());
+            }
+        }
     } while (num == 0 && g_streamRunning);
 
     if (num != sizeof(SWLINK_HELLO) || !g_streamRunning)
         return false;
 
-    if (swlinkUsbRead(USB_INTF_STREAM, &req, sizeof(req), HANDSHAKE_TIMEOUT) != sizeof(req))
+    size_t got = swlinkUsbRead(USB_INTF_STREAM, &req, sizeof(req), HANDSHAKE_TIMEOUT);
+    if (got != sizeof(req)) {
+        sdLogRc("握手读请求字节数", (Result)got);
         return false;
+    }
 
     SwlinkHandshakeResponse resp = { 0 };
 
@@ -377,8 +424,10 @@ static bool handshake(void)
     else
         resp.code = SWLINK_HANDSHAKE_OK;
 
-    if (swlinkUsbWrite(USB_INTF_STREAM, &resp, sizeof(resp), HANDSHAKE_TIMEOUT) != sizeof(resp))
+    if (swlinkUsbWrite(USB_INTF_STREAM, &resp, sizeof(resp), HANDSHAKE_TIMEOUT) != sizeof(resp)) {
+        sdLogRc("握手响应发送失败", swlinkUsbLastError());
         return false;
+    }
 
     sdLogRc("握手请求 magic", req.magic);
     sdLogRc("握手响应码 (0=成功)", resp.code);
@@ -431,6 +480,9 @@ void streamUsbThread(void* arg)
         if (written != n) {
             logWriteFail(written, n);
             disconnectClient();
+            /* 确认是主机断开(而不是主机暂时不读)就立刻重建 usb:ds,
+               这样短时间内重新插线也能再次握手 */
+            swlinkUsbNoteLinkLost();
         }
     }
 }
@@ -450,14 +502,27 @@ void streamVideoThread(void* arg)
             continue;
         }
 
+        /* 丢过包就从关键帧重新对齐:一直要求补 SPS/PPS,
+           并丢掉非 IDR 帧,避免解码器停在花屏/黑屏状态 */
+        const bool waitingKey = videoResync;
+        if (waitingKey)
+            captureVideoConnected();   /* 让下一帧带上 SPS/PPS */
+
         /* grc 失败也会产出错误包,照常发送 */
         captureReadVideo();
 
         if (!g_streamRunning)
             continue;
 
-        /* 发送只入队,队满丢帧;客户端重连时握手会重新要求 SPS/PPS */
-        sendPacket(&VPkt, VPkt.header.data_size + sizeof(SwlinkStreamHeader));
+        if (waitingKey) {
+            if (!captureVideoIsKeyframe())
+                continue;              /* 等下一个 IDR */
+            videoResync = false;
+        }
+
+        /* 发送只入队,队满丢帧;丢帧后从下一个关键帧重新开始 */
+        if (!sendPacket(&VPkt, VPkt.header.data_size + sizeof(SwlinkStreamHeader)))
+            videoResync = true;
     }
 }
 

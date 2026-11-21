@@ -3,6 +3,7 @@
  */
 #include "video_decoder.hpp"
 #include <cstring>
+#include "../../protocol/swlink_protocol.h"
 
 bool VideoDecoder::init()
 {
@@ -40,9 +41,14 @@ void VideoDecoder::shutdown()
     w_ = h_ = 0;
 }
 
-void VideoDecoder::feed(const uint8_t* data, size_t len)
+void VideoDecoder::feed(const uint8_t* data, size_t len, uint8_t flags)
 {
     if (!ctx_) return;
+
+    /* 设备在丢帧后重新对齐:带 SPS/PPS 的包意味着上一段流已不连续,
+       清空解码器状态,从新的 IDR 重新开始,否则会一直停在花屏/黑屏 */
+    if (flags & SWLINK_STREAM_FLAG_SPSPPS)
+        avcodec_flush_buffers(ctx_);
 
     while (len > 0) {
         uint8_t* out = nullptr;

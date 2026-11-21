@@ -32,7 +32,7 @@ bool streamServerHasNetClient(void);
 int streamServerNetFd(void);
 bool streamServerNetPending(void);      /* 队列里还有待发数据 */
 bool streamServerNetFlush(int fd);      /* 发送一次队列数据,false=链路出错 */
-bool streamServerNetRead(int fd);       /* 读取心跳,false=对端已关闭 */
+int streamServerNetRead(int fd);        /* 读心跳: 1=有数据 0=暂无 -1=已断开 */
 
 /* 握手线程暂存新会话,发送线程取走并接管(避免跨线程关闭 fd) */
 bool streamServerNetStage(int fd, bool wantVideo, bool wantAudio, uint8_t audioBatching);

@@ -39,3 +39,6 @@ void captureSetAudioBatching(int batch);
  */
 bool captureReadVideo(void);
 bool captureReadAudio(void);
+
+/* 刚读到的视频帧是否为 IDR(带 SPS/PPS 前缀时会跳过前缀再判断) */
+bool captureVideoIsKeyframe(void);
