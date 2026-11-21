@@ -29,7 +29,6 @@ void streamServerDetachNet(int fd);
 bool streamServerHasNetClient(void);
 
 /* 会话线程使用的接口 */
-int streamServerNetFd(void);
 bool streamServerNetPending(void);      /* 队列里还有待发数据 */
 bool streamServerNetFlush(int fd);      /* 发送一次队列数据,false=链路出错 */
 bool streamServerNetRead(int fd);       /* 读取心跳,false=对端已关闭 */
@@ -39,7 +38,3 @@ void streamServerNetStats(unsigned* dropped, u64* bytesSent);
 
 /* 发送耗时诊断:调用次数 / 累计 us / 单次最大 us / 当前队列积压字节 */
 void streamServerNetDiag(u32* calls, u64* sendUs, u32* maxUs, u32* backlog);
-
-/* 握手线程暂存新会话,发送线程取走并接管(避免跨线程关闭 fd) */
-bool streamServerNetStage(int fd, bool wantVideo, bool wantAudio, uint8_t audioBatching);
-int streamServerNetTakePending(bool* wantVideo, bool* wantAudio, uint8_t* audioBatching);

@@ -44,11 +44,7 @@ static volatile u32 netFlushCalls = 0;  /* flush 调用次数 */
 static volatile u64 netSendUs = 0;      /* send 累计耗时(us) */
 static volatile u32 netSendMaxUs = 0;   /* 单次 send 最大耗时(us) */
 
-/* 握手完成、等待发送线程接管的新会话。
-   用单个原子槽位传递,发送线程在空闲路径上不碰任何互斥锁。 */
-static volatile u64 pendingSlot = 0;
-
-/* 供发送线程无锁读取的会话 fd 副本 */
+/* 供发送会话线程无锁读取的 fd 副本 */
 static volatile int netFdPub = -1;
 
 /* 发送线程独占的待发块:把数据从共享队列拷出来后立刻释放锁,
@@ -105,11 +101,6 @@ bool streamServerHasNetClient(void)
     return netFdPub >= 0;
 }
 
-int streamServerNetFd(void)
-{
-    return netFdPub;
-}
-
 bool streamServerNetPending(void)
 {
     bool pending;
@@ -117,39 +108,6 @@ bool streamServerNetPending(void)
     pending = netFd >= 0 && netTxLen > netTxSent;
     mutexUnlock(&queueMutex);
     return pending;
-}
-
-/* 握手线程只把新连接暂存,由发送线程在自己的上下文里关闭旧会话并接管,
-   避免跨线程关闭正在使用的 fd。fd 用 +1 编码,0 表示空槽。 */
-bool streamServerNetStage(int fd, bool wantVideo, bool wantAudio, uint8_t audioBatching)
-{
-    u64 v;
-    u64 old;
-
-    if (fd < 0 || (!wantVideo && !wantAudio))
-        return false;
-
-    v = (u64)(u32)(fd + 1);
-    if (wantVideo) v |= 1ULL << 32;
-    if (wantAudio) v |= 1ULL << 33;
-    v |= (u64)audioBatching << 40;
-
-    old = __atomic_exchange_n(&pendingSlot, v, __ATOMIC_ACQ_REL);
-    if (old)
-        close((int)(u32)(old & 0xFFFFFFFFu) - 1);
-    return true;
-}
-
-int streamServerNetTakePending(bool* wantVideo, bool* wantAudio, uint8_t* audioBatching)
-{
-    u64 v = __atomic_exchange_n(&pendingSlot, 0, __ATOMIC_ACQ_REL);
-
-    if (!v)
-        return -1;
-    *wantVideo = (v >> 32) & 1;
-    *wantAudio = (v >> 33) & 1;
-    *audioBatching = (uint8_t)(v >> 40);
-    return (int)(u32)(v & 0xFFFFFFFFu) - 1;
 }
 
 bool streamServerAttachNet(int fd, bool wantVideo, bool wantAudio, uint8_t audioBatching)

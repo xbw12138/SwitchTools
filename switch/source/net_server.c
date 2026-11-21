@@ -116,8 +116,8 @@ static void setTimeouts(int fd, int recvSec, int sendMs)
 static void serveNetSession(int fd);
 
 /* 与 USB 版 stream_server.c 相同的握手顺序:发 HELLO -> 读请求 -> 回响应。
-   成功后把 fd 暂存,由接入线程自己接管发送。 */
-static bool doHandshake(int fd)
+   成功时把客户端需求写回调用方,由接入线程自己接管发送。 */
+static bool doHandshake(int fd, bool* wantVideo, bool* wantAudio, uint8_t* batching)
 {
     SwlinkHandshakeRequest req;
     SwlinkHandshakeResponse resp = { 0 };
@@ -150,8 +150,10 @@ static bool doHandshake(int fd)
     if (!req.want_video && !req.want_audio)
         return false;
 
-    return streamServerNetStage(fd, req.want_video != 0, req.want_audio != 0,
-                                req.audio_batching);
+    *wantVideo = req.want_video != 0;
+    *wantAudio = req.want_audio != 0;
+    *batching = req.audio_batching;
+    return true;
 }
 
 static void acceptThread(void* arg)
@@ -227,7 +229,11 @@ static void acceptThread(void* arg)
             /* 握手阶段用阻塞超时,成功后再交给发送线程 */
             setTimeouts(cfd, 5, 5000);
 
-            if (!doHandshake(cfd)) {
+            bool wantVideo = false;
+            bool wantAudio = false;
+            uint8_t batching = 0;
+
+            if (!doHandshake(cfd, &wantVideo, &wantAudio, &batching)) {
                 sdLog("无线握手失败, 断开");
                 close(cfd);
                 continue;
@@ -250,21 +256,13 @@ static void acceptThread(void* arg)
             sdLog("无线客户端已接入, 本线程开始发送");
 
             /* 会话由本线程创建,也由本线程发送,避免跨线程阻塞 send */
-            bool wantVideo = false;
-            bool wantAudio = false;
-            uint8_t batching = 0;
-            int sfd = streamServerNetTakePending(&wantVideo, &wantAudio, &batching);
-            if (sfd < 0) {
-                sdLog("无线会话暂存失败");
-                continue;
-            }
             streamServerDetachNet(-1);
-            if (!streamServerAttachNet(sfd, wantVideo, wantAudio, batching)) {
+            if (!streamServerAttachNet(cfd, wantVideo, wantAudio, batching)) {
                 sdLog("无线会话接管失败");
-                close(sfd);
+                close(cfd);
                 continue;
             }
-            serveNetSession(sfd);
+            serveNetSession(cfd);
         }
 
         close(fd);
@@ -308,11 +306,11 @@ static void serveNetSession(int fd)
             svcSleepThread(2E+6L);
         }
 
-        /* 每 5 秒打印一次发送统计,便于定位卡顿 */
+        /* 每 30 秒打印一次发送统计,便于定位卡顿 */
         u64 now = svcGetSystemTick();
         if (lastTick == 0)
             lastTick = now;
-        if (now - lastTick >= 5ULL * 19200000ULL) {
+        if (now - lastTick >= 30ULL * 19200000ULL) {
             unsigned drops = 0;
             u64 bytes = 0;
             u32 calls = 0, maxUs = 0, backlog = 0;
@@ -323,7 +321,7 @@ static void serveNetSession(int fd)
             /* 会话重建时计数会归零,避免出现巨大负数 */
             if (bytes < lastBytes) { lastBytes = bytes; lastCalls = calls; lastSendUs = sendUs; }
 
-            const u32 kbs = (u32)((bytes - lastBytes) / 5 / 1024);
+            const u32 kbs = (u32)((bytes - lastBytes) / 30 / 1024);
             const u32 dcalls = calls - lastCalls;
             const u32 avgMs = dcalls ? (u32)((sendUs - lastSendUs) / dcalls / 1000) : 0;
 
