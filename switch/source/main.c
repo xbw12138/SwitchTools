@@ -72,11 +72,18 @@ out:
         mutexUnlock(&g_logMutex);
 }
 
-/* 追加一行纯文本 (供 capture.c / stream_server.c 使用) */
+/* 追加一行纯文本 (供 capture.c / stream_server.c 使用)
+   一次写入整行,避免多线程各自写"正文"和"换行"导致日志错行 */
 void sdLog(const char* text)
 {
-    sdLogRaw(text, strlen(text));
-    sdLogRaw("\n", 1);
+    char buf[256];
+    size_t n = strlen(text);
+
+    if (n > sizeof(buf) - 2)
+        n = sizeof(buf) - 2;
+    memcpy(buf, text, n);
+    buf[n++] = '\n';
+    sdLogRaw(buf, n);
 }
 
 /* 追加 "标签: 0x12345678" */
@@ -97,22 +104,38 @@ void sdLogRc(const char* tag, Result rc)
     sdLogRaw(buf, n);
 }
 
+/* 服务就绪前反复重试,代替原先盲等 20 秒 */
+static Result initWithRetry(Result (*fn)(void), int attempts)
+{
+    Result rc = fn();
+    for (int i = 1; R_FAILED(rc) && i < attempts; i++) {
+        svcSleepThread(500000000ULL);
+        rc = fn();
+    }
+    return rc;
+}
+
 void __attribute__((weak)) __appInit(void)
 {
     mutexInit(&g_logMutex);
     g_logMutexReady = true;
 
-    svcSleepThread(20E+9); /* 等系统服务就绪 */
-
-    Result rc = smInitialize();
-    if (R_FAILED(rc))
+    Result rcSm = initWithRetry(smInitialize, 20);
+    if (R_FAILED(rcSm))
         fatalThrow(MAKERESULT(Module_Libnx, LibnxError_InitFail_SM));
 
-    rc = fsInitialize();
-    if (R_FAILED(rc))
+    Result rcFs = initWithRetry(fsInitialize, 20);
+    if (R_FAILED(rcFs))
         fatalThrow(MAKERESULT(Module_Libnx, LibnxError_InitFail_FS));
 
-    rc = setsysInitialize();
+    /* 尽早建立日志通道: 之后每一步失败都能在 SD 卡上看到 */
+    fsInitResult = fsOpenSdCardFileSystem(&sdCard);
+    sdLog("== __appInit 进入 ==");
+    sdLogRc("smInitialize", rcSm);
+    sdLogRc("fsInitialize", rcFs);
+    sdLogRc("SD 挂载", fsInitResult);
+
+    Result rc = setsysInitialize();
     if (R_SUCCEEDED(rc)) {
         SetSysFirmwareVersion fw;
         rc = setsysGetFirmwareVersion(&fw);
@@ -120,13 +143,11 @@ void __attribute__((weak)) __appInit(void)
             hosversionSet(MAKEHOSVERSION(fw.major, fw.minor, fw.micro));
         setsysExit();
     }
+    sdLogRc("setsysInitialize", rc);
     if (R_FAILED(rc))
         fatalThrow(rc);
 
-    /* 失败也无所谓,文件服务会在使用时报错 */
-    fsInitResult = fsOpenSdCardFileSystem(&sdCard);
-    sdLog("== __appInit 完成 ==");
-    sdLogRc("SD 挂载", fsInitResult);
+    sdLogRc("固件版本 (hex)", hosversionGet());
 }
 
 void __attribute__((weak)) __appExit(void)
@@ -144,10 +165,8 @@ int main(void)
     sdLog("======== SwLink 启动 ========");
     sdLogRc("固件版本 (hex)", hosversionGet());
 
-    rc = captureInitialize();
-    sdLogRc("captureInitialize", rc);
-    if (R_FAILED(rc))
-        fatalThrow(rc);
+    /* grc:d 改为按需初始化:开机不持有采集会话,避免影响锁屏/休眠 */
+    sdLog("采集服务延迟到首次客户端连接");
 
     /* usb:ds 在开机早期可能还没就绪,失败就重试 */
     for (int attempt = 1; attempt <= 10; attempt++) {

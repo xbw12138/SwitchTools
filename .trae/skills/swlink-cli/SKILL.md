@@ -1,6 +1,6 @@
 ---
 name: swlink-cli
-description: 通过 USB 读写 Switch SD 卡的命令行工具 swlink-cli 的使用教程，含上传下载、目录递归传输、NRO 推送与 USB 排障。当需要命令行批量操作 Switch SD 卡文件、推送 NRO 或排查 16C0:27DA 连接问题时使用。
+description: 通过 USB 读写 Switch SD 卡的命令行工具 swlink-cli 的使用教程，含设备端安装（商店一键装或手动装 sysmodule）、上传下载、目录递归传输、NRO 推送、Wi-Fi 串流与 USB 排障。当需要命令行批量操作 Switch SD 卡文件、推送 NRO、安装 SwLink sysmodule 或排查 16C0:27DA 连接问题时使用。
 ---
 
 # swlink-cli 使用教程
@@ -16,6 +16,9 @@ description: 通过 USB 读写 Switch SD 卡的命令行工具 swlink-cli 的使
 ## 前置条件
 
 1. 设备端已部署 SwLink sysmodule（title id `00FF0000A53B5A57`，`/atmosphere/contents/00FF0000A53B5A57/exefs.nsp`），且主机已开机
+   - 最省事：Switch 上打开 NXMiniApp 容器 → 应用商店 → **SwLink** → 安装 → 重启主机；之后可一键升级
+   - 手动装：解压 `dist/swlink-sysmodule-sd.zip` 到 SD 卡根目录（含 `exefs.nsp`、`toolbox.json`、`flags/boot2.flag`）
+   - 当前版本 **1.1.0**：修复 HOS 23.0.1 下 NPDM 被拒加载、锁屏/休眠唤醒后监听线程空转卡死
 2. USB-C **数据线**直插 Mac 机身口，不经过 hub / 扩展坞 / 显示器
 3. Switch 屏幕亮着、未休眠
 4. **SwLink.app 必须已退出**——USB 接口独占，App 在运行会报 `claim_interface: Access denied`
@@ -27,6 +30,13 @@ system_profiler SPUSBDataType | grep -A6 SwLink
 ```
 
 应看到 `SwLink Switch`、`Vendor ID: 0x16c0`、`Product ID: 0x27da`、`Serial Number: swlink-01`。
+
+## Wi-Fi 与 USB 的分工
+
+- **Wi-Fi 只能串流**：SwLink.app 里点「无线连接」，走 TCP `12345`（UDP `12346` 自动发现），
+  Switch 与 Mac 需在同一局域网，推荐 5GHz
+- **文件传输只走 USB**：`swlink-cli` 没有 `--wifi` 参数，SD 卡读写必须插线
+- 串流会话与文件接口互不阻塞，但同一个 USB 设备不能被 App 和 CLI 同时占用
 
 ## 构建
 
@@ -117,6 +127,8 @@ md5 -q /tmp/t.bin /tmp/t2.bin                              # 两行必须相同
 | `设备错误 2` | 路径不存在 |
 | 下载得到 0 字节 | 旧固件 `Stat` 对齐填充导致解析错位，升级设备端 nsp |
 | 传输后所有命令都不通 | 端点被打废，拔插 USB 线或重启主机 |
+| 锁屏唤醒后设备消失/连不上 | 唤醒后监听 socket 会失效，设备端 200ms 后自动重建；等 1~2 秒重试，日志出现 `TCP accept 异常 errno` 后跟 `TCP 监听` 即正常 |
+| 开机后 SD 卡上没有 `SwLink.log` | sysmodule 未加载（多因 NPDM 能力声明被固件拒绝）；换 1.1.0 及以后的包 |
 
 细节与逐步排查见 `skills/swlink-cli/references/troubleshooting.md`。
 

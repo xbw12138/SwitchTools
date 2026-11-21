@@ -374,6 +374,8 @@ static bool handshake(void)
         resp.code = SWLINK_HANDSHAKE_BAD_MAGIC;
     else if (req.proto_ver != ('0' | ('1' << 8)))
         resp.code = SWLINK_HANDSHAKE_BAD_VERSION;
+    else if (R_FAILED(captureEnsureInitialized()))
+        resp.code = SWLINK_HANDSHAKE_BAD_REQUEST;
     else
         resp.code = SWLINK_HANDSHAKE_OK;
 

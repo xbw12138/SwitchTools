@@ -22,6 +22,8 @@ extern AudioPacket APkt;
 
 /* 打开 grc:d 的两个 session (视频/音频) */
 Result captureInitialize(void);
+/* 首次客户端握手时按需初始化;之后重复调用无副作用 */
+Result captureEnsureInitialized(void);
 void captureFinalize(void);
 
 /* 新客户端连接后调用:重置状态,强制下一帧注入 SPS/PPS */

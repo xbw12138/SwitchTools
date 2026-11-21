@@ -3,6 +3,9 @@
 与串流接口共存于同一个 USB 复合设备（VID `0x16c0`、PID `0x27da`），三个接口：
 Interrupt（握手/输入）、Stream（视频/音频）、File（文件传输）。
 
+> 局域网（TCP `12345` / UDP `12346`）复用同一套串流握手与包格式，但**不提供文件通道**：
+> `SwlinkFtHeader` 与下列命令只走 USB 文件接口。设备端广播的发现响应里带的是串流端口。
+
 ## 请求头
 
 `SwlinkFtHeader`，40 字节、packed，定义在 `protocol/swlink_protocol.h`。

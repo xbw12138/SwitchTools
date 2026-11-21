@@ -20,6 +20,7 @@
 
 #include "net_server.h"
 #include "stream_server.h"
+#include "capture.h"
 #include "../../protocol/swlink_protocol.h"
 
 extern void sdLog(const char* text);
@@ -135,6 +136,8 @@ static bool doHandshake(int fd)
         resp.code = SWLINK_HANDSHAKE_BAD_MAGIC;
     } else if (req.proto_ver != ('0' | ('1' << 8))) {
         resp.code = SWLINK_HANDSHAKE_BAD_VERSION;
+    } else if (R_FAILED(captureEnsureInitialized())) {
+        resp.code = SWLINK_HANDSHAKE_BAD_REQUEST;
     } else {
         resp.code = SWLINK_HANDSHAKE_OK;
     }
@@ -199,7 +202,9 @@ static void acceptThread(void* arg)
         /* 监听 socket 也设超时,accept 才能周期性回到循环检查退出标志
            (不要在别的线程 close 它,避免阻塞中的 accept 返回后二次 close) */
         setTimeouts(fd, 1, 1000);
-        sdLogRc("TCP 监听", SWLINK_TCP_PORT);
+        static int listenLogged = 0;
+        if (listenLogged++ < 3)
+            sdLogRc("TCP 监听", SWLINK_TCP_PORT);
 
         while (g_netRunning) {
             struct sockaddr_in peer;
@@ -209,7 +214,17 @@ static void acceptThread(void* arg)
             if (cfd < 0) {
                 if (!g_netRunning)
                     break;
-                continue;
+                /* 正常超时:继续等待。其他错误(通常是休眠唤醒后句柄失效)
+                   必须退避并重建监听 socket,否则会变成 100% 忙等拖死系统。 */
+                if (errno == ETIMEDOUT || errno == EAGAIN ||
+                    errno == EWOULDBLOCK || errno == EINTR) {
+                    continue;
+                }
+                static int errLog = 0;
+                if (errLog++ < 5)
+                    sdLogRc("TCP accept 异常 errno", (Result)errno);
+                svcSleepThread(2E+8L);
+                break;
             }
 
             one = 1;
@@ -330,7 +345,21 @@ static void discoveryThread(void* arg)
 
             ssize_t n = recvfrom(fd, &req, sizeof(req), 0,
                                  (struct sockaddr*)&from, &flen);
-            if (n != (ssize_t)sizeof(req) || !g_netRunning)
+
+            if (n < 0) {
+                if (!g_netRunning)
+                    break;
+                if (errno == ETIMEDOUT || errno == EAGAIN ||
+                    errno == EWOULDBLOCK || errno == EINTR) {
+                    continue;
+                }
+                static int errLog = 0;
+                if (errLog++ < 5)
+                    sdLogRc("UDP recv 异常 errno", (Result)errno);
+                svcSleepThread(2E+8L);
+                break;
+            }
+            if (n != (ssize_t)sizeof(req))
                 continue;
             if (memcmp(req.magic, SWLINK_DISCOVER_REQ, sizeof(req.magic)) != 0)
                 continue;

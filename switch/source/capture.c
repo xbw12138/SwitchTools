@@ -97,10 +97,33 @@ Result captureInitialize(void)
     return 0;
 }
 
+/* 按需初始化:开机不持有 grc:d 会话,避免待机/锁屏时影响系统休眠。
+   首个客户端握手成功时才真正打开,之后复用同一对会话。 */
+static bool captureReady = false;
+static Mutex captureInitMutex;
+
+Result captureEnsureInitialized(void)
+{
+    Result rc = 0;
+
+    mutexLock(&captureInitMutex);
+    if (!captureReady) {
+        rc = captureInitialize();
+        if (R_SUCCEEDED(rc))
+            captureReady = true;
+        sdLogRc("captureInitialize(按需)", rc);
+    }
+    mutexUnlock(&captureInitMutex);
+
+    return rc;
+}
+
 void captureFinalize(void)
 {
-    serviceClose(&grcdVideo);
-    serviceClose(&grcdAudio);
+    if (serviceIsActive(&grcdVideo))
+        serviceClose(&grcdVideo);
+    if (serviceIsActive(&grcdAudio))
+        serviceClose(&grcdAudio);
 }
 
 void captureVideoConnected(void)

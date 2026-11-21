@@ -50,7 +50,10 @@ curl -LO https://raw.githubusercontent.com/xbw12138/SwitchTools/main/dist/swlink
 unzip swlink-sysmodule-sd.zip -d /Volumes/SWITCH    # 换成你的 SD 卡挂载点
 ```
 
-包里含 `atmosphere/contents/00FF0000A53B5A57/{exefs.nsp,toolbox.json,flags/boot2.flag}` 与一份 `README-sysmodule.txt`。
+包里含 `atmosphere/contents/00FF0000A53B5A57/{exefs.nsp,toolbox.json,flags/boot2.flag}`。
+
+**更省事的方式**:Switch 上打开 NXMiniApp 容器 → 应用商店 → **SwLink** → 安装,重启主机即可。
+之后商店里出现新版本时,在「更新」页一键升级,不用再拔 SD 卡。
 
 重启主机,或在 Tesla 菜单的 Sysmodules 里启用。
 
@@ -63,6 +66,15 @@ open build/SwLink.app    # 双击 App 即可运行,无需命令行
 
 > 构建产物是自包含的 `mac/build/SwLink.app`(依赖库与图标已打进包内,已做本地临时签名)。
 > 首次打开若被系统拦截,右键 → 打开即可。
+
+**不想编译**:直接下载预编译的 App(macOS x86_64,已内置 SDL2 / libusb / ffmpeg,Apple Silicon 需装 Rosetta):
+
+```sh
+curl -LO https://raw.githubusercontent.com/xbw12138/SwitchTools/main/dist/swlink-app-macos.zip
+unzip swlink-app-macos.zip
+xattr -dr com.apple.quarantine SwLink.app
+open SwLink.app
+```
 
 > ffmpeg 不通过 Homebrew 安装:旧版 macOS(如 12)上 brew 没有预编译包,源码编译还会
 > 连带 Python 等重型依赖。`setup.sh` 会自行下载 ffmpeg 7.1 并只编译 h264 解码器,
@@ -122,9 +134,12 @@ cd mac && cmake --build build -j        # 产物:mac/build/swlink-cli
 - **不要与 SysDVR 同时运行**:usb:ds 为独占设备,两个 sysmodule 会冲突
 - **无线串流**:720p30 码流约 4–10 Mbps,5GHz 稳定;2.4GHz 或信号差时可能掉帧/重连。
   主机会在链路中断后提示断开,重新点连接即可;无线模式不支持 SD 卡文件传输
+- **锁屏/休眠安全**:采集服务延迟到首次客户端连接时才打开,待机时不持有 `grc:d`;
+  唤醒后若监听 socket 失效,设备端会自动退避重建(日志 `TCP accept 异常 errno` 后跟
+  `TCP 监听` 即自愈),不需要重启主机
 - 视频为 grc 硬编 720p H.264,延迟比 RTSP/网络方案略低但不等于零
 - 文件传输走文件接口,与串流互不阻塞;大文件按 512KB 分块
-- **换另一台 Switch**:固件同为 18.1.0 时直接复制 SD 卡上的 3 个文件即可;固件版本不同需按该版本同期 libnx 重编(否则模块静默不加载),详见[教程 2.2 节](docs/使用教程.md)
+- **换另一台 Switch**:固件同为 18.1.0 / 23.0.1 时直接复制 SD 卡上的 3 个文件即可;固件版本不同需按该版本同期 libnx 重编(否则模块静默不加载),详见[教程 2.3 节](docs/使用教程.md)
 - 系统版本要求 5.0+(仅实现 usb:ds 新接口)
 
 ## 目录结构
@@ -151,4 +166,5 @@ mac/                         macOS 客户端(CMake 工程)
   macos/Info.plist           App 包元信息
   macos/AppIcon.icns         应用图标
   scripts/bundle_app.sh      把依赖库打进 .app 并做本地签名
+dist/                        预编译发行包(sysmodule zip / macOS App / CLI)
 ```
