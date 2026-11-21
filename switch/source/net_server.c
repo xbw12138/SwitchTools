@@ -114,14 +114,6 @@ static void setTimeouts(int fd, int recvSec, int sendMs)
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sv, sizeof(sv));
 }
 
-/* Horizon BSD 的 fcntl 常量沿用 BSD ABI:F_SETFL=4,O_NONBLOCK=4。
-   成功后会话 socket 的 send/recv 都不会再阻塞。 */
-static void trySetNonBlocking(int fd)
-{
-    Result rc = (Result)bsdFcntl(fd, 4, 4);
-    sdLogRc("无线 socket 非阻塞", rc);
-}
-
 /* 与 USB 版 stream_server.c 相同的握手顺序:发 HELLO -> 读请求 -> 回响应。
    成功后把 fd 交给 stream_server 发送线程。 */
 static bool doHandshake(int fd)
@@ -240,8 +232,10 @@ static void acceptThread(void* arg)
                 continue;
             }
 
-            setTimeouts(cfd, 1, 20);
-            trySetNonBlocking(cfd);
+            /* 与文件通道保持一致:保持阻塞 + 3s 发送超时,由专用发送线程背压。
+               原来的非阻塞 + 20ms 超时会在高码率下反复 EAGAIN,导致发送线程
+               空转、队列被丢包,表现为画面只有几帧每秒。 */
+            setTimeouts(cfd, 1, 3000);
             sdLog("无线客户端已接入, 等待发送线程接管");
         }
 

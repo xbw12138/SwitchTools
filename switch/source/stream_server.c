@@ -230,7 +230,7 @@ bool streamServerNetFlush(int fd)
         }
         return true;
     }
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+    if (n < 0 && errno == EINTR)
         return true;
     {
         static int errLogged = 0;

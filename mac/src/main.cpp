@@ -129,6 +129,8 @@ static float g_fps = 0.0f;
 static Uint64 g_rxTick = 0;
 static uint64_t g_rxLast = 0;
 static double g_rxMBs = 0.0;
+static std::atomic<int> g_videoPkts{0};   /* 收到的视频包计数 */
+static double g_pktRate = 0.0;
 
 static void setError(const std::string& s)
 {
@@ -385,7 +387,10 @@ static bool connectDevice(bool wifi = false)
 
     g_stream = new StreamClient(*g_link);
     g_stream->start(
-        [](const uint8_t* d, uint32_t l, uint8_t) { g_decoder.feed(d, l); },
+        [](const uint8_t* d, uint32_t l, uint8_t) {
+            g_videoPkts++;
+            g_decoder.feed(d, l);
+        },
         [](const uint8_t* d, uint32_t l) { g_audio.queue(d, l); },
         []() { g_connected = false; g_status = "连接已断开"; });
     return true;
@@ -945,19 +950,23 @@ static void drawStreamPage(SDL_Renderer* renderer)
             } else if (now - g_rxTick >= 500) {
                 g_rxMBs = (double)(total - g_rxLast) * 1000.0 /
                           (double)(now - g_rxTick) / (1024.0 * 1024.0);
+                g_pktRate = (double)g_videoPkts.exchange(0) * 1000.0 /
+                            (double)(now - g_rxTick);
                 g_rxTick = now;
                 g_rxLast = total;
             }
         }
 
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_TEXT_DIM));
-        ImGui::Text("%dx%d  ·  %.1f fps  ·  %llu 帧  ·  %.1f MB/s",
+        ImGui::Text("%dx%d  ·  %.1f fps  ·  %llu 帧  ·  %.1f MB/s  ·  收包 %.0f/s",
                     g_decoder.width(), g_decoder.height(), g_fps,
-                    (unsigned long long)g_decoder.framesDecoded(), g_rxMBs);
+                    (unsigned long long)g_decoder.framesDecoded(), g_rxMBs, g_pktRate);
         ImGui::PopStyleColor();
     } else {
         g_rxTick = 0;
         g_rxMBs = 0.0;
+        g_videoPkts = 0;
+        g_pktRate = 0.0;
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_TEXT_FAINT));
         ImGui::TextUnformatted("未连接");
         ImGui::PopStyleColor();
