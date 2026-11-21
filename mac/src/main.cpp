@@ -74,6 +74,7 @@ static std::string g_errorText;
 /* Wi-Fi 连接面板 */
 static char g_wifiIp[64] = "";
 static int g_wifiPort = SWLINK_TCP_PORT;
+static int g_wifiFilePort = SWLINK_FT_TCP_PORT;
 static bool g_wifiPopup = false;
 static std::vector<NetDevice> g_wifiDevices;
 static std::mutex g_wifiDevMutex;
@@ -243,6 +244,51 @@ static void applyTheme()
     c[ImGuiCol_NavHighlight]    = ImVec4(0.32f, 0.55f, 1.00f, 1.00f);
 }
 
+/* ---------------- 通用控件 ---------------- */
+
+static bool accentButton(const char* label, const ImVec2& size = ImVec2(0, 0))
+{
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.45f, 0.90f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.32f, 0.52f, 0.98f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.22f, 0.40f, 0.80f, 1.0f));
+    const bool r = ImGui::Button(label, size);
+    ImGui::PopStyleColor(3);
+    return r;
+}
+
+static bool ghostButton(const char* label, const ImVec2& size = ImVec2(0, 0))
+{
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.16f, 0.20f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.23f, 0.29f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.24f, 0.28f, 0.35f, 1.0f));
+    const bool r = ImGui::Button(label, size);
+    ImGui::PopStyleColor(3);
+    return r;
+}
+
+static bool dangerButton(const char* label, const ImVec2& size = ImVec2(0, 0))
+{
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.16f, 0.18f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.20f, 0.22f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.50f, 0.22f, 0.24f, 1.0f));
+    const bool r = ImGui::Button(label, size);
+    ImGui::PopStyleColor(3);
+    return r;
+}
+
+/* 圆角小标签:显示通道 / 能力,不占交互 */
+static void chip(const char* text, ImU32 color)
+{
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    const float h = ts.y + 9.0f;
+    const float w = ts.x + 20.0f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), (color & 0x00FFFFFFu) | 0x24000000u, h * 0.5f);
+    dl->AddText(ImVec2(p.x + 10, p.y + 4), color, text);
+    ImGui::Dummy(ImVec2(w, h));
+}
+
 /* ---------------- 文件页状态 ---------------- */
 
 static char g_path[768] = "/";
@@ -262,6 +308,7 @@ static std::atomic<uint64_t> g_ftTotal{0};    /* 本次任务总字节(未统计
 static std::atomic<uint64_t> g_sdTotal{0};    /* SD 总容量 */
 static std::atomic<uint64_t> g_sdFree{0};     /* SD 剩余容量 */
 static bool g_filesLoaded = false;       /* 首次进入文件页时自动列目录 */
+static int g_ctxIndex = -1;              /* 右键菜单当前条目 */
 
 static void refreshList();
 static bool rowSelected(int idx);
@@ -305,6 +352,7 @@ static bool connectDevice(bool wifi = false)
 
     if (wifi) {
         g_netLink.setEndpoint(g_wifiIp, (uint16_t)(g_wifiPort > 0 ? g_wifiPort : SWLINK_TCP_PORT));
+        g_netLink.setFilePort((uint16_t)(g_wifiFilePort > 0 ? g_wifiFilePort : SWLINK_FT_TCP_PORT));
         g_link = &g_netLink;
     } else {
         g_link = &g_usbLink;
@@ -537,7 +585,13 @@ static void drawWifiPopup()
     if (!g_wifiPopup)
         return;
 
-    ImGui::SetNextWindowSize(ImVec2(460, 0), ImGuiCond_Appearing);
+    /* 允许从串流页的空状态按钮触发:外部只置标志,这里统一打开弹窗 */
+    if (!ImGui::IsPopupOpen("无线连接###wifi_popup")) {
+        ImGui::OpenPopup("无线连接###wifi_popup");
+        startWifiScan();
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_Appearing);
     if (!ImGui::BeginPopupModal("无线连接###wifi_popup", &g_wifiPopup,
                                 ImGuiWindowFlags_AlwaysAutoResize)) {
         g_wifiPopup = false;
@@ -545,20 +599,7 @@ static void drawWifiPopup()
     }
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_TEXT_DIM),
-                       "Switch 与 Mac 需要连接同一个 Wi-Fi。");
-    ImGui::Spacing();
-
-    ImGui::SetNextItemWidth(220);
-    ImGui::InputTextWithHint("##wifiip", "Switch IP,如 192.168.1.20",
-                             g_wifiIp, sizeof(g_wifiIp));
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(90);
-    ImGui::InputInt("##wifiport", &g_wifiPort, 0, 0);
-    ImGui::SameLine();
-    ImGui::TextDisabled("端口");
-
-    ImGui::Spacing();
-    ImGui::Separator();
+                       "Switch 与 Mac 需要连接同一个 Wi-Fi(建议 5GHz)");
     ImGui::Spacing();
 
     std::vector<NetDevice> devs;
@@ -570,41 +611,76 @@ static void drawWifiPopup()
     if (g_wifiIp[0] == 0 && !devs.empty()) {
         snprintf(g_wifiIp, sizeof(g_wifiIp), "%s", devs[0].ip.c_str());
         g_wifiPort = devs[0].port;
+        if (devs[0].filePort)
+            g_wifiFilePort = devs[0].filePort;
     }
 
-    if (g_wifiScanning.load())
-        ImGui::TextDisabled("正在搜索局域网设备...");
-    else if (devs.empty())
-        ImGui::TextDisabled("未发现设备,可手动填写 IP 后连接");
-    else
+    /* 设备列表:每台一行卡片,显示串流/文件端口 */
+    ImGui::BeginChild("##devlist", ImVec2(0, devs.empty() ? 56.0f : 118.0f), true);
+    if (g_wifiScanning.load()) {
+        ImGui::TextDisabled("正在搜索局域网设备…");
+    } else if (devs.empty()) {
+        ImGui::TextDisabled("未自动发现设备,请在下方手动填写 IP");
+    } else {
         ImGui::TextDisabled("发现 %d 台设备,点击选择:", (int)devs.size());
+        for (const auto& d : devs) {
+            char label[128];
+            if (d.filePort)
+                snprintf(label, sizeof(label), "%s   串流 %u · 文件 %u",
+                         d.ip.c_str(), (unsigned)d.port, (unsigned)d.filePort);
+            else
+                snprintf(label, sizeof(label), "%s   串流 %u · 无文件通道",
+                         d.ip.c_str(), (unsigned)d.port);
 
-    for (const auto& d : devs) {
-        char label[96];
-        snprintf(label, sizeof(label), "%s:%u", d.ip.c_str(), (unsigned)d.port);
-        if (ImGui::Selectable(label, g_wifiIp == d.ip)) {
-            snprintf(g_wifiIp, sizeof(g_wifiIp), "%s", d.ip.c_str());
-            g_wifiPort = d.port;
+            ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(255, 255, 255, 10));
+            const bool selected = (strcmp(g_wifiIp, d.ip.c_str()) == 0);
+            if (ImGui::Selectable(label, selected, 0, ImVec2(0, 28))) {
+                snprintf(g_wifiIp, sizeof(g_wifiIp), "%s", d.ip.c_str());
+                g_wifiPort = d.port;
+                g_wifiFilePort = d.filePort ? d.filePort : SWLINK_FT_TCP_PORT;
+            }
+            ImGui::PopStyleColor();
         }
     }
+    ImGui::EndChild();
 
     ImGui::Spacing();
+    ImGui::TextDisabled("串流端口");
+    ImGui::SameLine(72);
+    ImGui::SetNextItemWidth(96);
+    ImGui::InputInt("##wifiport", &g_wifiPort, 0, 0);
+    ImGui::SameLine(0, 16);
+    ImGui::TextDisabled("文件端口");
+    ImGui::SameLine(0, 8);
+    ImGui::SetNextItemWidth(96);
+    ImGui::InputInt("##wififtport", &g_wifiFilePort, 0, 0);
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("地址");
+    ImGui::SameLine(72);
+    ImGui::SetNextItemWidth(260);
+    ImGui::InputTextWithHint("##wifiip", "如 192.168.1.20", g_wifiIp, sizeof(g_wifiIp));
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
     ImGui::BeginDisabled(g_wifiScanning.load());
-    if (ImGui::Button("重新搜索", ImVec2(120, 32)))
+    if (ghostButton(g_wifiScanning.load() ? "搜索中…" : "重新搜索", ImVec2(112, 34)))
         startWifiScan();
     ImGui::EndDisabled();
 
-    ImGui::SameLine();
+    ImGui::SameLine(0, 10);
     ImGui::BeginDisabled(g_wifiIp[0] == 0);
-    if (ImGui::Button("连接", ImVec2(120, 32))) {
+    if (accentButton("连接", ImVec2(112, 34))) {
         g_wifiPopup = false;
         ImGui::CloseCurrentPopup();
         connectDevice(true);
     }
     ImGui::EndDisabled();
 
-    ImGui::SameLine();
-    if (ImGui::Button("取消", ImVec2(120, 32))) {
+    ImGui::SameLine(0, 10);
+    if (ghostButton("取消", ImVec2(112, 34))) {
         g_wifiPopup = false;
         ImGui::CloseCurrentPopup();
     }
@@ -625,13 +701,17 @@ static void drawTopBar()
     dl->AddLine(ImVec2(p.x, p.y + h - 1), ImVec2(p.x + w, p.y + h - 1),
                 IM_COL32(255, 255, 255, 14));
 
-    /* 左侧标题 */
-    dl->AddText(g_fontTitle, g_fontTitle->FontSize, ImVec2(p.x + 24, p.y + 20),
-                COL_ACCENT, "SwLink");
+    /* 左侧品牌区 */
+    const float logoX = p.x + 22;
+    dl->AddRectFilled(ImVec2(logoX, p.y + 20), ImVec2(logoX + 30, p.y + 50), COL_ACCENT, 8.0f);
+    dl->AddText(ImVec2(logoX + 9, p.y + 27), IM_COL32(255, 255, 255, 255), "S");
+
+    dl->AddText(g_fontTitle, g_fontTitle->FontSize, ImVec2(logoX + 44, p.y + 19),
+                COL_TEXT, "SwLink");
     ImGui::PushFont(g_fontTitle);
     const float titleW = ImGui::CalcTextSize("SwLink").x;
     ImGui::PopFont();
-    dl->AddText(ImVec2(p.x + 24 + titleW + 16, p.y + 29), COL_TEXT_FAINT,
+    dl->AddText(ImVec2(logoX + 44 + titleW + 14, p.y + 30), COL_TEXT_FAINT,
                 "Switch 串流 / 文件传输");
 
     /* 右侧:状态灯 + 状态文字 + 连接按钮 */
@@ -640,48 +720,38 @@ static void drawTopBar()
     const ImVec2 btnPos(p.x + w - 24 - btnGroupW, p.y + (h - btnH) * 0.5f);
 
     const std::string err = errorText();
-    const char* st = g_connected ? "已连接" : (err.empty() ? "未连接" : "连接失败");
-    const float stW = ImGui::CalcTextSize(st).x;
-    const ImVec2 stPos(btnPos.x - 30 - stW, p.y + h * 0.5f - ImGui::GetTextLineHeight() * 0.5f);
-
-    /* 通道信息:USB / Wi-Fi */
-    const char* chanInfo = g_connected ? (g_useWifi ? "Wi-Fi" : "USB") : "";
-    if (g_connected) {
-        const float infoW = ImGui::CalcTextSize(chanInfo).x;
-        dl->AddText(ImVec2(stPos.x - 26.0f - infoW, stPos.y), COL_TEXT_DIM, chanInfo);
-    }
-
-    dl->AddCircleFilled(ImVec2(stPos.x - 14, p.y + h * 0.5f), 5.0f,
-                        g_connected ? COL_OK : COL_ERR);
-    dl->AddText(stPos, g_connected ? COL_TEXT_DIM
-                                   : (err.empty() ? COL_TEXT_FAINT : COL_ERR), st);
+    const std::string st = g_connected
+        ? (g_useWifi ? "已连接 · Wi-Fi" : "已连接 · USB")
+        : (err.empty() ? "未连接" : "连接失败");
+    const ImVec2 ts = ImGui::CalcTextSize(st.c_str());
+    const float pillH = 28.0f;
+    const float pillW = ts.x + 42.0f;
+    const ImVec2 pill0(btnPos.x - 16 - pillW, p.y + (h - pillH) * 0.5f);
+    const ImU32 pillBg = g_connected ? IM_COL32(61, 205, 150, 26)
+                                     : (err.empty() ? IM_COL32(255, 255, 255, 10)
+                                                    : IM_COL32(255, 107, 107, 26));
+    dl->AddRectFilled(pill0, ImVec2(pill0.x + pillW, pill0.y + pillH), pillBg, pillH * 0.5f);
+    dl->AddCircleFilled(ImVec2(pill0.x + 16, pill0.y + pillH * 0.5f), 4.5f,
+                        g_connected ? COL_OK : (err.empty() ? COL_TEXT_FAINT : COL_ERR));
+    dl->AddText(ImVec2(pill0.x + 28, pill0.y + (pillH - ts.y) * 0.5f),
+                g_connected ? COL_TEXT : COL_TEXT_DIM, st.c_str());
 
     ImGui::BeginDisabled(g_ftBusy || g_nxBusy.load());
     ImGui::SetCursorScreenPos(btnPos);
     if (g_connected) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.24f, 0.28f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.25f, 0.27f, 1.0f));
-        if (ImGui::Button("断开", ImVec2(btnGroupW, btnH))) disconnectDevice();
-        ImGui::PopStyleColor(2);
+        if (ghostButton("断开", ImVec2(btnGroupW, btnH)))
+            disconnectDevice();
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.23f, 0.29f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.30f, 0.38f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.30f, 0.34f, 0.42f, 1.0f));
-        if (ImGui::Button("USB 连接", ImVec2(btnW, btnH)))
+        if (accentButton("USB 连接", ImVec2(btnW, btnH)))
             connectDevice(false);
-        ImGui::PopStyleColor(3);
 
         ImGui::SameLine(0, btnGap);
 
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.45f, 0.90f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.32f, 0.52f, 0.98f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.22f, 0.40f, 0.80f, 1.0f));
-        if (ImGui::Button("无线连接", ImVec2(btnW, btnH))) {
+        if (ghostButton("无线连接", ImVec2(btnW, btnH))) {
             g_wifiPopup = true;
             ImGui::OpenPopup("无线连接###wifi_popup");
             startWifiScan();
         }
-        ImGui::PopStyleColor(3);
     }
     ImGui::EndDisabled();
 
@@ -692,27 +762,51 @@ static void drawTopBar()
 
 /* ---------------- 侧边栏 ---------------- */
 
-static void navItem(const char* label, int page)
+/* 侧边栏图标:全部用基础图元绘制,不依赖图标字体 */
+static void navIcon(ImDrawList* dl, ImVec2 p, int page, ImU32 col)
+{
+    const float th = 1.6f;
+    if (page == 0) {
+        dl->AddRect(ImVec2(p.x, p.y + 1), ImVec2(p.x + 16, p.y + 11), col, 2.0f, 0, th);
+        dl->AddLine(ImVec2(p.x + 8, p.y + 11), ImVec2(p.x + 8, p.y + 15), col, th);
+        dl->AddLine(ImVec2(p.x + 4.5f, p.y + 15), ImVec2(p.x + 11.5f, p.y + 15), col, th);
+    } else if (page == 1) {
+        dl->AddRectFilled(ImVec2(p.x, p.y + 4), ImVec2(p.x + 16, p.y + 15), col, 2.0f);
+        dl->AddRectFilled(ImVec2(p.x, p.y + 1.5f), ImVec2(p.x + 7, p.y + 6), col, 1.5f);
+    } else if (page == 2) {
+        dl->AddLine(ImVec2(p.x + 8, p.y + 1), ImVec2(p.x + 8, p.y + 10), col, th);
+        dl->AddLine(ImVec2(p.x + 5, p.y + 7), ImVec2(p.x + 8, p.y + 10), col, th);
+        dl->AddLine(ImVec2(p.x + 11, p.y + 7), ImVec2(p.x + 8, p.y + 10), col, th);
+        dl->AddLine(ImVec2(p.x + 2, p.y + 13), ImVec2(p.x + 14, p.y + 13), col, th);
+    } else {
+        dl->AddCircle(ImVec2(p.x + 8, p.y + 8), 7.0f, col, 0, th);
+        dl->AddText(ImVec2(p.x + 5.2f, p.y + 0.5f), col, "?");
+    }
+}
+
+static void navItem(const char* label, int page, float width)
 {
     const bool selected = (g_page == page);
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float h = 40.0f;
 
-    ImGui::PushStyleColor(ImGuiCol_Header, selected ? COL_ACCENT_SOFT : IM_COL32(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(255, 255, 255, 18));
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(255, 255, 255, 26));
-    ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
-
-    if (ImGui::Selectable(label, selected, ImGuiSelectableFlags_None, ImVec2(0, 44)))
+    ImGui::InvisibleButton(label, ImVec2(width, h));
+    const bool hovered = ImGui::IsItemHovered();
+    if (ImGui::IsItemClicked())
         g_page = page;
 
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor(3);
-
-    if (selected) {
-        ImGui::GetWindowDrawList()->AddRectFilled(
-            ImVec2(p0.x - 16, p0.y + 12), ImVec2(p0.x - 13, p0.y + 32),
-            COL_ACCENT, 2.0f);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (selected || hovered) {
+        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + h),
+                          selected ? COL_ACCENT_SOFT : IM_COL32(255, 255, 255, 14), 8.0f);
     }
+    if (selected)
+        dl->AddRectFilled(ImVec2(p.x, p.y + 10), ImVec2(p.x + 3, p.y + h - 10), COL_ACCENT, 2.0f);
+
+    navIcon(dl, ImVec2(p.x + 14, p.y + (h - 16) * 0.5f), page,
+            selected ? COL_ACCENT : COL_TEXT_DIM);
+    dl->AddText(ImVec2(p.x + 40, p.y + (h - ImGui::GetTextLineHeight()) * 0.5f),
+                selected ? COL_TEXT : COL_TEXT_DIM, label);
 }
 
 static void drawSidebar()
@@ -723,27 +817,29 @@ static void drawSidebar()
     const float h = ImGui::GetContentRegionAvail().y;
 
     dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), COL_SIDEBAR);
+    dl->AddLine(ImVec2(p.x + w - 1, p.y), ImVec2(p.x + w - 1, p.y + h),
+                IM_COL32(255, 255, 255, 12));
 
-    ImGui::SetCursorScreenPos(ImVec2(p.x + 34, p.y + 22));
-    dl->AddText(ImVec2(p.x + 34, p.y + 22), COL_TEXT_FAINT, "功能");
+    dl->AddText(ImVec2(p.x + 24, p.y + 26), COL_TEXT_FAINT, "功能");
 
-    ImGui::SetCursorScreenPos(ImVec2(p.x + 18, p.y + 46));
+    ImGui::SetCursorScreenPos(ImVec2(p.x + 12, p.y + 50));
     ImGui::BeginGroup();
-    navItem("串流画面", 0);
-    navItem("SD 卡文件", 1);
-    navItem("NRO 推送", 2);
-    navItem("使用帮助", 3);
+    const float itemW = w - 24.0f;
+    navItem("串流画面", 0, itemW);
+    navItem("SD 卡文件", 1, itemW);
+    navItem("NRO 推送", 2, itemW);
+    navItem("使用帮助", 3, itemW);
     ImGui::EndGroup();
 
     /* 底部:连接状态 + 版本 */
-    dl->AddCircleFilled(ImVec2(p.x + 28, p.y + h - 60), 4.0f,
+    dl->AddCircleFilled(ImVec2(p.x + 24, p.y + h - 60), 4.0f,
                         g_connected ? COL_OK : COL_ERR);
-    dl->AddText(ImVec2(p.x + 40, p.y + h - 67),
+    dl->AddText(ImVec2(p.x + 36, p.y + h - 67),
                 g_connected ? COL_TEXT_DIM : COL_TEXT_FAINT,
                 g_connected ? "已连接" : "未连接");
 
     dl->AddText(ImVec2(p.x + 24, p.y + h - 40), COL_TEXT_FAINT,
-                "v0.2  ·  USB " "16C0:27DA");
+                "v0.3  ·  USB / Wi-Fi");
     dl->AddText(ImVec2(p.x + 24, p.y + h - 24), COL_TEXT_FAINT,
                 "H.264 720p30");
 }
@@ -910,18 +1006,43 @@ static void drawStreamPage(SDL_Renderer* renderer)
         const ImVec2 o(ip.x + (inner.x - w) * 0.5f, ip.y + (inner.y - h) * 0.5f);
         dl->AddImage((ImTextureID)tex, o, ImVec2(o.x + w, o.y + h));
     } else {
-        const char* msg  = g_connected ? "等待画面..." : "尚未连接";
+        const char* msg  = g_connected ? "等待画面…" : "还没有连接 Switch";
         const char* hint = g_connected
             ? "请进入游戏并停留在游戏画面(主菜单不产生录制输出)"
-            : "点击右上角「连接 Switch」开始串流";
-        const float hw = ImGui::CalcTextSize(hint).x;
-        const float cy = ip.y + inner.y * 0.42f;
+            : "插上 USB 线,或让 Switch 与 Mac 连同一个 Wi-Fi";
+
+        const float cy = ip.y + inner.y * 0.40f;
+
+        /* 空状态图标:一台显示器 */
+        {
+            const ImU32 ic = IM_COL32(82, 142, 255, 150);
+            const ImVec2 q(ip.x + inner.x * 0.5f - 17, cy - 54);
+            dl->AddRect(q, ImVec2(q.x + 34, q.y + 25), ic, 6.0f, 0, 1.8f);
+            dl->AddLine(ImVec2(q.x + 17, q.y + 25), ImVec2(q.x + 17, q.y + 31), ic, 1.8f);
+            dl->AddLine(ImVec2(q.x + 10, q.y + 31), ImVec2(q.x + 24, q.y + 31), ic, 1.8f);
+        }
+
         ImGui::PushFont(g_fontTitle);
         const float tw = ImGui::CalcTextSize(msg).x;
         dl->AddText(g_fontTitle, g_fontTitle->FontSize,
-                    ImVec2(ip.x + (inner.x - tw) * 0.5f, cy), COL_TEXT_FAINT, msg);
+                    ImVec2(ip.x + (inner.x - tw) * 0.5f, cy),
+                    g_connected ? COL_TEXT_FAINT : COL_TEXT_DIM, msg);
         ImGui::PopFont();
-        dl->AddText(ImVec2(ip.x + (inner.x - hw) * 0.5f, cy + 36), COL_TEXT_FAINT, hint);
+
+        const float hw = ImGui::CalcTextSize(hint).x;
+        dl->AddText(ImVec2(ip.x + (inner.x - hw) * 0.5f, cy + 40), COL_TEXT_FAINT, hint);
+
+        if (!g_connected) {
+            const float bw = 132.0f, bh = 36.0f, gap = 14.0f;
+            const float bx = ip.x + (inner.x - (bw * 2 + gap)) * 0.5f;
+            const float by = cy + 78;
+            ImGui::SetCursorScreenPos(ImVec2(bx, by));
+            if (accentButton("USB 连接", ImVec2(bw, bh)))
+                connectDevice(false);
+            ImGui::SameLine(0, gap);
+            if (ghostButton("无线连接", ImVec2(bw, bh)))
+                g_wifiPopup = true;
+        }
     }
 
     ImGui::EndChild();
@@ -937,9 +1058,26 @@ static void drawStreamPage(SDL_Renderer* renderer)
 
 /* ---------------- 文件页 ---------------- */
 
+static bool crumbButton(const char* label, bool current)
+{
+    ImGui::PushStyleColor(ImGuiCol_Button,
+                          current ? IM_COL32(255, 255, 255, 16) : IM_COL32(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(255, 255, 255, 24));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(255, 255, 255, 32));
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          current ? ImGui::ColorConvertU32ToFloat4(COL_TEXT)
+                                  : ImGui::ColorConvertU32ToFloat4(COL_TEXT_DIM));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10, 5));
+    const bool clicked = ImGui::Button(label);
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(4);
+    return clicked;
+}
+
 static void drawBreadcrumb()
 {
-    if (ImGui::Button("SD 根目录")) {
+    if (crumbButton("SD 根目录", strcmp(g_path, "/") == 0)) {
         snprintf(g_path, sizeof(g_path), "/");
         refreshList();
     }
@@ -954,12 +1092,12 @@ static void drawBreadcrumb()
         rest = (pos == std::string::npos) ? std::string() : rest.substr(pos + 1);
         if (seg.empty()) continue;
 
-        ImGui::SameLine(0, 6);
+        ImGui::SameLine(0, 2);
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_TEXT_FAINT), "/");
-        ImGui::SameLine(0, 6);
+        ImGui::SameLine(0, 2);
 
         const std::string target = acc + seg;
-        if (ImGui::SmallButton(seg.c_str())) {
+        if (crumbButton(seg.c_str(), rest.empty())) {
             snprintf(g_path, sizeof(g_path), "%s", target.c_str());
             refreshList();
         }
@@ -1343,12 +1481,16 @@ static void drawFilePage()
 {
     if (!g_connected || !g_files) {
         const ImVec2 avail = ImGui::GetContentRegionAvail();
-        const char* msg = !g_connected
-                              ? "尚未连接,请先连接 Switch"
-                              : "Wi-Fi 模式暂不支持 SD 卡文件传输,请用 USB 连接";
+        const char* msg = !g_connected ? "尚未连接,请先连接 Switch"
+                                       : "当前连接不支持文件传输";
+        const char* hint = !g_connected ? "USB 或 Wi-Fi 连接后即可浏览 SD 卡"
+                                        : "请升级 Switch 端 SwLink 后重试";
         const float w = ImGui::CalcTextSize(msg).x;
-        ImGui::SetCursorPos(ImVec2((avail.x - w) * 0.5f, avail.y * 0.45f));
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_TEXT_FAINT), "%s", msg);
+        ImGui::SetCursorPos(ImVec2((avail.x - w) * 0.5f, avail.y * 0.42f));
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_TEXT_DIM), "%s", msg);
+        const float hw = ImGui::CalcTextSize(hint).x;
+        ImGui::SetCursorPos(ImVec2((avail.x - hw) * 0.5f, avail.y * 0.42f + 26.0f));
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_TEXT_FAINT), "%s", hint);
         const std::string err = errorText();
         if (!err.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_ERR));
@@ -1368,21 +1510,20 @@ static void drawFilePage()
 
     buildView();
 
-    /* 面包屑 + 刷新 + 搜索 */
-    drawBreadcrumb();
-    ImGui::SameLine(0, 10);
-    if (ImGui::Button("刷新"))
-        refreshList();
+    /* 标题行:通道 + 目录统计 */
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_TEXT));
+    ImGui::TextUnformatted("SD 卡文件");
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, 12);
+    chip(g_useWifi ? "Wi-Fi 文件通道" : "USB 文件通道", COL_ACCENT);
+    ImGui::SameLine(0, 12);
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_TEXT_FAINT), "%d 项",
+                       (int)g_entries.size());
 
-    {
-        const float filterW = 210.0f;
-        const float x = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - filterW;
-        ImGui::SameLine();
-        if (x > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(x);
-        ImGui::SetNextItemWidth(filterW);
-        if (ImGui::InputTextWithHint("##filter", "搜索名称", g_filter, sizeof(g_filter)))
-            clearSelection();
-    }
+    ImGui::Spacing();
+
+    /* 面包屑 */
+    drawBreadcrumb();
 
     ImGui::Spacing();
 
@@ -1393,17 +1534,17 @@ static void drawFilePage()
         if (g_entries[idx].type == 1) selHasDir = true;
     }
 
-    /* 操作按钮行 */
-    ImGui::BeginDisabled(g_ftBusy || !hasSel);
-    if (ImGui::Button(sel.size() > 1 ? "下载选中" : "下载", ImVec2(0, 30)))
-        beginDownloadSelected();
-    ImGui::EndDisabled();
-    ImGui::SameLine();
+    /* 工具栏:左侧导航与写入,右侧对选中项操作 */
+    const ImVec2 btnSize(0, 32);
 
+    ImGui::BeginDisabled(g_ftBusy);
+    if (ghostButton("刷新", btnSize))
+        refreshList();
+    ImGui::SameLine(0, 8);
     {
         const std::string up = g_path;
         ImGui::BeginDisabled(g_ftBusy || up == "/");
-        if (ImGui::Button("上一级", ImVec2(0, 30))) {
+        if (ghostButton("上一级", btnSize)) {
             std::string p = up;
             while (p.size() > 1 && p.back() == '/') p.pop_back();
             const size_t pos = p.find_last_of('/');
@@ -1413,42 +1554,57 @@ static void drawFilePage()
         }
         ImGui::EndDisabled();
     }
-    ImGui::SameLine();
-
-    ImGui::BeginDisabled(g_ftBusy);
-    if (ImGui::Button("上传", ImVec2(0, 30))) {
+    ImGui::SameLine(0, 8);
+    if (ghostButton("上传", btnSize)) {
         g_modalInput1[0] = 0;
         g_modalInput2[0] = 0;
         ImGui::OpenPopup("上传文件");
     }
-    ImGui::SameLine();
-    if (ImGui::Button("新建目录", ImVec2(0, 30))) {
+    ImGui::SameLine(0, 8);
+    if (ghostButton("新建目录", btnSize)) {
         g_modalInput1[0] = 0;
         ImGui::OpenPopup("新建目录");
     }
     ImGui::EndDisabled();
-    ImGui::SameLine();
 
-    ImGui::BeginDisabled(g_ftBusy || sel.size() != 1);
-    if (ImGui::Button("重命名", ImVec2(0, 30)) && sel.size() == 1) {
-        snprintf(g_modalInput1, sizeof(g_modalInput1), "%s", g_entries[sel[0]].name.c_str());
-        g_modalTarget = joinPath(g_path, g_entries[sel[0]].name);
-        ImGui::OpenPopup("重命名");
-    }
-    ImGui::SameLine();
+    /* 右侧:搜索框 + 主操作 */
+    {
+        const float groupW = 300.0f;
+        const float x = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - groupW;
+        if (x > ImGui::GetCursorPosX())
+            ImGui::SetCursorPosX(x);
 
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.16f, 0.18f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.20f, 0.22f, 1.0f));
-    if (ImGui::Button("删除", ImVec2(0, 30)) && hasSel) {
-        g_modalTargets.clear();
-        for (int idx : sel)
-            g_modalTargets.emplace_back(joinPath(g_path, g_entries[idx].name),
-                                        g_entries[idx].type == 1);
-        g_modalIsDir = selHasDir;
-        ImGui::OpenPopup("删除确认");
+        ImGui::SetNextItemWidth(150);
+        if (ImGui::InputTextWithHint("##filter", "搜索名称", g_filter, sizeof(g_filter)))
+            clearSelection();
+        ImGui::SameLine(0, 8);
+
+        ImGui::BeginDisabled(g_ftBusy || !hasSel);
+        if (accentButton(sel.size() > 1 ? "下载选中" : "下载", ImVec2(0, 32)))
+            beginDownloadSelected();
+        ImGui::EndDisabled();
+        ImGui::SameLine(0, 8);
+
+        ImGui::BeginDisabled(g_ftBusy || sel.size() != 1);
+        if (ghostButton("重命名", ImVec2(0, 32)) && sel.size() == 1) {
+            snprintf(g_modalInput1, sizeof(g_modalInput1), "%s", g_entries[sel[0]].name.c_str());
+            g_modalTarget = joinPath(g_path, g_entries[sel[0]].name);
+            ImGui::OpenPopup("重命名");
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine(0, 8);
+
+        ImGui::BeginDisabled(g_ftBusy || !hasSel);
+        if (dangerButton("删除", ImVec2(0, 32)) && hasSel) {
+            g_modalTargets.clear();
+            for (int idx : sel)
+                g_modalTargets.emplace_back(joinPath(g_path, g_entries[idx].name),
+                                            g_entries[idx].type == 1);
+            g_modalIsDir = selHasDir;
+            ImGui::OpenPopup("删除确认");
+        }
+        ImGui::EndDisabled();
     }
-    ImGui::PopStyleColor(2);
-    ImGui::EndDisabled();
 
     ImGui::Spacing();
 
@@ -1457,9 +1613,10 @@ static void drawFilePage()
     const float bottomH = (g_ftBusy.load() ? 36.0f : 70.0f) + (err.empty() ? 0.0f : 24.0f);
     const float listH = ImGui::GetContentRegionAvail().y - bottomH;
     const ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                               ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit;
+                               ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX;
 
     int enterIdx = -1;
+    int ctxIdx = -1;
 
     if (ImGui::BeginTable("##files", 3, tf, ImVec2(0, listH > 60 ? listH : 60))) {
         ImGui::TableSetupColumn("类型", ImGuiTableColumnFlags_WidthFixed, 52.0f);
@@ -1494,9 +1651,15 @@ static void drawFilePage()
         if (g_view.empty()) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::Dummy(ImVec2(0, 2));
+            ImGui::Dummy(ImVec2(0, 3));
             ImGui::TableNextColumn();
-            ImGui::TextDisabled("%s", g_entries.empty() ? "此目录为空" : "没有匹配的条目");
+            if (g_entries.empty()) {
+                ImGui::TextDisabled("空目录");
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_TEXT_FAINT),
+                                   "把文件或文件夹拖进窗口即可上传");
+            } else {
+                ImGui::TextDisabled("没有匹配“%s”的条目", g_filter);
+            }
             ImGui::TableNextColumn();
         }
 
@@ -1537,6 +1700,15 @@ static void drawFilePage()
                     }
                 }
             }
+            if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                if (!rowSelected(i)) {
+                    g_multi.clear();
+                    g_selected = i;
+                    g_anchor = i;
+                }
+                ctxIdx = i;
+                ImGui::OpenPopup("###rowctx");
+            }
 
             /* 大小列 */
             ImGui::TableNextColumn();
@@ -1561,6 +1733,110 @@ static void drawFilePage()
         const std::string target = joinPath(g_path, g_entries[enterIdx].name);
         snprintf(g_path, sizeof(g_path), "%s", target.c_str());
         refreshList();
+    }
+
+    if (ctxIdx >= 0 && ctxIdx < (int)g_entries.size())
+        g_ctxIndex = ctxIdx;
+
+    /* 右键菜单 */
+    if (ImGui::BeginPopup("###rowctx")) {
+        if (g_ctxIndex >= 0 && g_ctxIndex < (int)g_entries.size()) {
+            const FtEntry& e = g_entries[g_ctxIndex];
+            const std::string full = joinPath(g_path, e.name);
+
+            ImGui::TextDisabled("%s", e.name.c_str());
+            ImGui::Separator();
+
+            if (ImGui::MenuItem(e.type == 1 ? "打开" : "下载")) {
+                g_selected = g_ctxIndex;
+                g_multi.clear();
+                if (e.type == 1) {
+                    snprintf(g_path, sizeof(g_path), "%s", full.c_str());
+                    refreshList();
+                } else {
+                    beginDownloadSelected();
+                }
+            }
+            if (ImGui::MenuItem("重命名")) {
+                snprintf(g_modalInput1, sizeof(g_modalInput1), "%s", e.name.c_str());
+                g_modalTarget = full;
+                ImGui::CloseCurrentPopup();
+                ImGui::OpenPopup("重命名");
+            }
+            if (ImGui::MenuItem("复制路径"))
+                ImGui::SetClipboardText(full.c_str());
+            ImGui::Separator();
+            if (ImGui::MenuItem("删除")) {
+                g_modalTargets.clear();
+                g_modalTargets.emplace_back(full, e.type == 1);
+                g_modalIsDir = (e.type == 1);
+                ImGui::CloseCurrentPopup();
+                ImGui::OpenPopup("删除确认");
+            }
+        }
+        ImGui::EndPopup();
+    }
+
+    /* 键盘操作:仅在没有输入框/弹窗抢焦点时生效 */
+    ImGuiIO& io = ImGui::GetIO();
+    const bool canKey = !g_ftBusy.load() && !io.WantTextInput &&
+                        ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+    if (canKey) {
+        const bool mod = io.KeySuper || io.KeyCtrl;
+        if (mod && ImGui::IsKeyPressed(ImGuiKey_A)) {
+            g_multi.clear();
+            g_selected = -1;
+            for (int idx : g_view) g_multi.push_back(idx);
+            if (!g_multi.empty()) {
+                g_selected = g_multi.front();
+                g_multi.erase(g_multi.begin());
+            }
+        }
+        if (mod && ImGui::IsKeyPressed(ImGuiKey_R))
+            refreshList();
+        if (ImGui::IsKeyPressed(ImGuiKey_Backspace) && strcmp(g_path, "/") != 0) {
+            std::string p = g_path;
+            while (p.size() > 1 && p.back() == '/') p.pop_back();
+            const size_t pos = p.find_last_of('/');
+            p = (pos == 0 || pos == std::string::npos) ? "/" : p.substr(0, pos);
+            snprintf(g_path, sizeof(g_path), "%s", p.c_str());
+            refreshList();
+        }
+        if ((ImGui::IsKeyPressed(ImGuiKey_Delete)) && !selectedIndices().empty()) {
+            g_modalTargets.clear();
+            bool anyDir = false;
+            for (int idx : selectedIndices()) {
+                g_modalTargets.emplace_back(joinPath(g_path, g_entries[idx].name),
+                                            g_entries[idx].type == 1);
+                anyDir = anyDir || g_entries[idx].type == 1;
+            }
+            g_modalIsDir = anyDir;
+            ImGui::OpenPopup("删除确认");
+        }
+        if ((ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) &&
+            g_selected >= 0 && g_selected < (int)g_entries.size()) {
+            const FtEntry& e = g_entries[g_selected];
+            if (e.type == 1) {
+                const std::string target = joinPath(g_path, e.name);
+                snprintf(g_path, sizeof(g_path), "%s", target.c_str());
+                refreshList();
+            } else {
+                beginDownloadSelected();
+            }
+        }
+        if ((ImGui::IsKeyPressed(ImGuiKey_DownArrow) || ImGui::IsKeyPressed(ImGuiKey_UpArrow)) &&
+            !g_view.empty()) {
+            int pos = -1;
+            for (int k = 0; k < (int)g_view.size(); k++)
+                if (g_view[k] == g_selected) pos = k;
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
+                pos = (pos < 0) ? 0 : std::min(pos + 1, (int)g_view.size() - 1);
+            else
+                pos = (pos <= 0) ? 0 : pos - 1;
+            g_multi.clear();
+            g_selected = g_view[pos];
+            g_anchor = g_selected;
+        }
     }
 
     /* 底部:进度 / 条目数 / 状态 / SD 空间 / 错误 */
@@ -1607,24 +1883,37 @@ static void drawFilePage()
         s_speed = 0.0;
 
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_TEXT_DIM));
-        ImGui::Text("%d 个条目", (int)g_entries.size());
+        ImGui::Text("%d 个条目 · 已选 %d", (int)g_entries.size(),
+                    (int)selectedIndices().size());
         const std::string status = ftStatus();
         if (!status.empty()) {
             ImGui::SameLine(0, 12);
             ImGui::TextDisabled("%s", status.c_str());
         }
-        if (g_sdTotal.load() > 0) {
-            ImGui::SameLine(0, 12);
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_TEXT_FAINT),
-                               "SD 剩余 %s / %s",
-                               humanSize(g_sdFree.load()).c_str(),
-                               humanSize(g_sdTotal.load()).c_str());
-        }
         ImGui::PopStyleColor();
 
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_TEXT_FAINT));
-        ImGui::Text("可多选(Cmd/Shift) · 双击目录进入 · 双击文件下载 · 拖入文件或文件夹即上传");
-        ImGui::PopStyleColor();
+        if (g_sdTotal.load() > 0) {
+            const uint64_t total = g_sdTotal.load();
+            const uint64_t freeSpace = g_sdFree.load();
+            const uint64_t used = total > freeSpace ? total - freeSpace : 0;
+            const float frac = total > 0 ? (float)((double)used / (double)total) : 0.0f;
+
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+                                  frac > 0.9f ? ImGui::ColorConvertU32ToFloat4(COL_ERR)
+                                              : ImGui::ColorConvertU32ToFloat4(COL_ACCENT));
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(1, 1, 1, 0.06f));
+            ImGui::ProgressBar(frac, ImVec2(180, 8), "");
+            ImGui::PopStyleColor(2);
+            ImGui::SameLine(0, 10);
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_TEXT_FAINT),
+                               "已用 %s / %s · 剩余 %s",
+                               humanSize(used).c_str(), humanSize(total).c_str(),
+                               humanSize(freeSpace).c_str());
+        }
+
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_TEXT_FAINT),
+                           "双击进入/下载 · 右键更多操作 · ⌘A 全选 · Del 删除 · ⌘R 刷新 · 拖入即上传");
     }
 
     if (!err.empty()) {
@@ -1930,9 +2219,11 @@ int main(int, char**)
 
         ImGui::SameLine();
 
-        /* 内容区 */
+        /* 内容区:做成一张圆角卡片,与侧边栏区分开 */
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(22, 18));
-        ImGui::BeginChild("##content", ImVec2(0, 0), false);
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.0f);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.082f, 0.092f, 0.112f, 1.0f));
+        ImGui::BeginChild("##content", ImVec2(0, 0), true);
         if (g_page == 0)
             drawStreamPage(renderer);
         else if (g_page == 1)
@@ -1942,7 +2233,8 @@ int main(int, char**)
         else
             drawHelpPage();
         ImGui::EndChild();
-        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar(2);
 
         ImGui::End();
 

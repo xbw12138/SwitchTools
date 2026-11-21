@@ -18,7 +18,7 @@ description: 通过 USB 读写 Switch SD 卡的命令行工具 swlink-cli 的使
 1. 设备端已部署 SwLink sysmodule（title id `00FF0000A53B5A57`，`/atmosphere/contents/00FF0000A53B5A57/exefs.nsp`），且主机已开机
    - 最省事：Switch 上打开 NXMiniApp 容器 → 应用商店 → **SwLink** → 安装 → 重启主机；之后可一键升级
    - 手动装：解压 `dist/swlink-sysmodule-sd.zip` 到 SD 卡根目录（含 `exefs.nsp`、`toolbox.json`、`flags/boot2.flag`）
-   - 当前版本 **1.1.0**：修复 HOS 23.0.1 下 NPDM 被拒加载、锁屏/休眠唤醒后监听线程空转卡死
+   - 当前版本 **1.2.0**：新增局域网 SD 卡文件通道（TCP 12347）；修复 HOS 23.0.1 下 NPDM 被拒加载、锁屏/休眠唤醒后监听线程空转卡死
 2. USB-C **数据线**直插 Mac 机身口，不经过 hub / 扩展坞 / 显示器
 3. Switch 屏幕亮着、未休眠
 4. **SwLink.app 必须已退出**——USB 接口独占，App 在运行会报 `claim_interface: Access denied`
@@ -33,9 +33,11 @@ system_profiler SPUSBDataType | grep -A6 SwLink
 
 ## Wi-Fi 与 USB 的分工
 
-- **Wi-Fi 只能串流**：SwLink.app 里点「无线连接」，走 TCP `12345`（UDP `12346` 自动发现），
+- **Wi-Fi 串流**：SwLink.app 里点「无线连接」，走 TCP `12345`（UDP `12346` 自动发现），
   Switch 与 Mac 需在同一局域网，推荐 5GHz
-- **文件传输只走 USB**：`swlink-cli` 没有 `--wifi` 参数，SD 卡读写必须插线
+- **Wi-Fi 文件**：1.2.0 起设备端多监听一个 TCP `12347`，App 的文件页会按需另开连接，
+  与串流互不干扰；大文件仍建议插 USB
+- **CLI 只走 USB**：`swlink-cli` 没有 `--wifi` 参数，SD 卡读写必须插线
 - 串流会话与文件接口互不阻塞，但同一个 USB 设备不能被 App 和 CLI 同时占用
 
 ## 构建

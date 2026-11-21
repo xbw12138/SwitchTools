@@ -1,11 +1,14 @@
 /*
  * file_server.c
- * SD 卡文件传输服务:处理 USB 文件接口上的请求
+ * SD 卡文件传输服务:USB 文件接口与局域网 TCP 共用同一套请求处理
  * (原生 fs IPC,不经过 fsdev,无堆分配)
  */
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/socket.h>
 
 #include "file_server.h"
 #include "usb_link.h"
@@ -32,14 +35,19 @@ static void ftLog(const char* fmt, ...)
 typedef struct {
     u8* buf;              /* sizeof(SwlinkFtHeader) + SWLINK_FT_CHUNK */
     FsFileSystem* sd;
+    int fd;               /* -1 = USB 文件接口, >=0 = 局域网 TCP 连接 */
 } FileSession;
 
 static alignas(0x1000) u8 g_buf[sizeof(SwlinkFtHeader) + SWLINK_FT_CHUNK + SWLINK_FT_PATH_MAX + 2];
 static FsFileSystem g_sd;
 
+/* USB 线程与 TCP 会话共用 g_buf / g_payload,一次只允许一个请求在跑 */
+static Mutex g_ioMutex;
+
 void fileServerInit(FsFileSystem* sd)
 {
     memcpy(&g_sd, sd, sizeof(FsFileSystem));
+    mutexInit(&g_ioMutex);
 }
 
 static u32 mapError(Result rc)
@@ -69,12 +77,26 @@ static u32 parsePath(const u8* payload, u32 payload_len, char* out, u32 out_size
     return SWLINK_FT_OK;
 }
 
-static size_t writeAll(const void* data, size_t size)
+static size_t writeAll(FileSession* s, const void* data, size_t size)
 {
     const u8* p = (const u8*)data;
     size_t sent = 0;
 
     while (sent < size) {
+        if (s->fd >= 0) {
+            /* TCP: 发送超时由 SO_SNDTIMEO 控制,失败即视为连接断开 */
+            ssize_t n = send(s->fd, p + sent, size - sent, 0);
+            if (n > 0) {
+                sent += (size_t)n;
+                continue;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                if (!g_fileRunning) return 0;
+                continue;
+            }
+            return 0;
+        }
+
         u32 want = (u32)(size - sent);
         if (want > FT_IO_SLICE) want = FT_IO_SLICE;
 
@@ -93,7 +115,7 @@ static size_t respond(FileSession* s, SwlinkFtHeader* resp, const void* payload,
     /* 处理函数可能已直接在 buf payload 区构建数据,避免同地址拷贝 */
     if (payload_len && (const u8*)payload != s->buf + sizeof(SwlinkFtHeader))
         memcpy(s->buf + sizeof(SwlinkFtHeader), payload, payload_len);
-    return writeAll(s->buf, total) == total ? total : 0;
+    return writeAll(s, s->buf, total) == total ? total : 0;
 }
 
 /* 收满 size 字节;false = 断开或已停止运行 */
@@ -108,6 +130,29 @@ static bool readFull(FileSession* s, void* dst, u32 size)
             return false;
 
         u32 want = size - got;
+
+        if (s->fd >= 0) {
+            /* TCP: recv 超时(SO_RCVTIMEO)返回 EAGAIN,按切片累计 */
+            ssize_t n = recv(s->fd, p + got, want, 0);
+            if (n == 0) {
+                ftLog("FT 局域网连接关闭 got=%u/%u", got, size);
+                return false;
+            }
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                    if (got > 0 && ++idleSlices >= 6) {
+                        ftLog("FT 局域网读中断 got=%u/%u", got, size);
+                        return false;
+                    }
+                    continue;
+                }
+                return false;
+            }
+            idleSlices = 0;
+            got += (u32)n;
+            continue;
+        }
+
         if (want > FT_IO_SLICE) want = FT_IO_SLICE;
 
         size_t n = swlinkUsbRead(USB_INTF_FILE, p + got, want, FT_SLICE);
@@ -330,8 +375,12 @@ static bool handleOne(FileSession* s)
 {
     SwlinkFtHeader req;
 
+    /* 请求头读到栈上,不碰共享缓冲,因此等头期间不持锁:
+       USB 主机空闲时读头会一直超时,持锁会把局域网文件通道饿死 */
     if (!readFull(s, &req, sizeof(req)))
         return false;
+
+    mutexLock(&g_ioMutex);
 
     SwlinkFtHeader resp = req;          /* magic/cmd/seq 回显 */
     resp.status = SWLINK_FT_OK;
@@ -344,6 +393,7 @@ static bool handleOne(FileSession* s)
         ftLog("FT 请求魔数/长度异常 magic=0x%x plen=%u", req.magic, req.payload_len);
         resp.status = SWLINK_FT_ERR_BAD_REQUEST;
         respond(s, &resp, NULL, 0);
+        mutexUnlock(&g_ioMutex);
         return true;
     }
     if (req.payload_len >= 1024)
@@ -351,8 +401,10 @@ static bool handleOne(FileSession* s)
               (unsigned long long)req.offset, req.size, req.payload_len);
 
     u8* payload = g_payload;
-    if (req.payload_len && !readFull(s, payload, req.payload_len))
+    if (req.payload_len && !readFull(s, payload, req.payload_len)) {
+        mutexUnlock(&g_ioMutex);
         return false;
+    }
 
     char path[SWLINK_FT_PATH_MAX + 1];
     u32 err = SWLINK_FT_OK;
@@ -412,6 +464,7 @@ static bool handleOne(FileSession* s)
         resp.status = err;
         respond(s, &resp, NULL, 0);
     }
+    mutexUnlock(&g_ioMutex);
     return true;
 }
 
@@ -419,10 +472,26 @@ void fileServerThread(void* arg)
 {
     (void)arg;
 
-    FileSession s = { .buf = g_buf, .sd = &g_sd };
+    FileSession s = { .buf = g_buf, .sd = &g_sd, .fd = -1 };
 
     while (g_fileRunning) {
         /* USB 超时只会返回 0,readFull 会继续等;false 仅代表半截请求作废 */
-        handleOne(&s);
+        bool ok = handleOne(&s);
+
+        if (!ok) {
+            /* USB 通道本身不能退出,让出一点 CPU 后重新同步 */
+            svcSleepThread(1E+6L);
+        }
+    }
+}
+
+/* 局域网文件会话:一个 TCP 连接独占,直到对端关闭或服务停止 */
+void fileServerNetServe(int fd)
+{
+    FileSession s = { .buf = g_buf, .sd = &g_sd, .fd = fd };
+
+    while (g_fileRunning) {
+        if (!handleOne(&s))
+            break;
     }
 }

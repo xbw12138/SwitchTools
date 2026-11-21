@@ -15,6 +15,7 @@
 struct NetDevice {
     std::string ip;
     uint16_t port = 0;
+    uint16_t filePort = 0;   /* 0 = 设备未提供文件通道 */
 };
 
 /* 向局域网广播发现请求,返回在 timeoutMs 内响应的设备 */
@@ -32,7 +33,12 @@ public:
     {
         ip_ = ip;
         port_ = port;
+        /* 换了设备就丢掉旧的文件连接,避免写到上一台机器 */
+        closeFile();
     }
+
+    /* 文件通道端口:通常取发现响应里的 ft_port,默认 12347 */
+    void setFilePort(uint16_t port) { filePort_ = port; }
 
     const std::string& ip() const { return ip_; }
     uint16_t port() const { return port_; }
@@ -46,10 +52,10 @@ public:
 
     int streamReadSome(void* data, int maxLen, unsigned timeoutMs) override;
 
-    /* 无线模式暂不实现文件通道 */
+    /* 文件通道:独立的 TCP 连接,首次使用时才建立 */
     int fileReadSome(void* data, int maxLen, unsigned timeoutMs) override;
     bool fileWrite(const void* data, int len, unsigned timeoutMs) override;
-    bool supportsFileTransfer() const override { return false; }
+    bool supportsFileTransfer() const override { return true; }
 
     const char* lastError() const override { return err_; }
 
@@ -58,10 +64,14 @@ private:
     bool recvExact(void* data, int len, int timeoutMs);
     void heartbeatLoop();
     void stopHeartbeat();
+    bool fileEnsureOpen();
+    void closeFile();
 
     std::string ip_;
     uint16_t port_ = 0;
+    uint16_t filePort_ = 0;
     int fd_ = -1;
+    int fileFd_ = -1;
     char err_[192] = {0};
 
     std::thread heartbeat_;

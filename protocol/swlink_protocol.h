@@ -94,6 +94,8 @@ typedef struct {
  */
 #define SWLINK_TCP_PORT       12345
 #define SWLINK_DISCOVER_PORT  12346
+/* 局域网 SD 卡文件通道:与串流分开监听,连上即为裸的 FT 请求/响应流 */
+#define SWLINK_FT_TCP_PORT    12347
 
 /* UDP 发现:主机向广播地址发 16 字节请求,设备回同样大小的响应。
  * 响应源 IP 即设备地址,不必在负载里再带一遍。 */
@@ -104,7 +106,8 @@ typedef struct {
     char     magic[16];   /* SWLINK_DISCOVER_REQ / SWLINK_DISCOVER_RESP */
     uint16_t tcp_port;    /* 响应:串流端口(小端) */
     uint16_t proto_ver;   /* '0','1' 两个 ASCII 字节 */
-    uint32_t reserved;
+    uint16_t ft_port;     /* 响应:文件端口(小端),0 = 不支持 */
+    uint16_t reserved;
 } SwlinkDiscoveryMsg;
 
 /* ---------------- 文件传输 ---------------- */

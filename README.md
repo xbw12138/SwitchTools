@@ -15,7 +15,7 @@ USB 线或同一 Wi-Fi 连接 Switch(大气层 Atmosphere)与 macOS,实现 **游
 
 - **接口 0(串流)**:OUT 握手 / IN 复用视频+音频包流(18B 头 + payload)
 - **接口 1(文件)**:40B 请求/响应头 + payload,8 条命令(PING/LIST/STAT/READ/WRITE/MKDIR/DELETE/RENAME)
-- **无线**:TCP `12345` 复用同一套握手与包格式;UDP `12346` 负责局域网发现,SD 卡文件传输仍走 USB
+- **无线**:TCP `12345` 复用同一套握手与包格式;UDP `12346` 负责局域网发现;TCP `12347` 是独立的 SD 卡文件通道
 - 协议契约见 [protocol/swlink_protocol.h](protocol/swlink_protocol.h),USB VID:PID = `16C0:27DA`
 
 > 只想用、不想看代码?直接看 **[分步使用教程](docs/使用教程.md)**(含"一次成功"检查清单和按现象排错表)。
@@ -91,7 +91,8 @@ open SwLink.app
 3. 进游戏即出画面和声音;「独立窗口」可把纯画面弹到单独窗口(可缩放到副屏/外接屏),
    打开后主窗口停止渲染画面
 4. 「SD 卡文件」页可浏览 SD 卡、多选/递归下载、上传(支持整目录拖入)、新建/重命名/批量删除;
-   点表头排序,传输中显示速度、剩余时间并可取消,底部显示 SD 剩余容量(文件功能仅 USB 模式可用)
+   点表头排序,传输中显示速度、剩余时间并可取消,底部显示 SD 剩余容量。
+   **USB 与 Wi-Fi 都支持文件传输**:无线模式会按需另开一条 TCP `12347` 连接,不占串流带宽
 5. 把本地文件或文件夹直接拖进窗口,即可上传到当前目录
 6. 「NRO 推送」页把本地 `.nro` 经 USB 写入 SD 卡(默认 `switch/`),之后在 Switch 上
    按住 R 启动 hbmenu,进 `switch` 目录点选即可运行
@@ -133,7 +134,8 @@ cd mac && cmake --build build -j        # 产物:mac/build/swlink-cli
 - **只有支持系统录屏(长按截图键)的游戏才能采集**。不支持的游戏和主菜单 `grc:d` 会无限阻塞(无画面,属正常现象)。建议安装 [dvr-patches](https://github.com/exelix11/dvr-patches) 解锁全部游戏
 - **不要与 SysDVR 同时运行**:usb:ds 为独占设备,两个 sysmodule 会冲突
 - **无线串流**:720p30 码流约 4–10 Mbps,5GHz 稳定;2.4GHz 或信号差时可能掉帧/重连。
-  主机会在链路中断后提示断开,重新点连接即可;无线模式不支持 SD 卡文件传输
+  主机会在链路中断后提示断开,重新点连接即可
+- **无线文件**:SD 卡读写走独立的 TCP `12347`,与串流互不影响;大文件建议优先插线(USB 更快)
 - **锁屏/休眠安全**:采集服务延迟到首次客户端连接时才打开,待机时不持有 `grc:d`;
   唤醒后若监听 socket 失效,设备端会自动退避重建(日志 `TCP accept 异常 errno` 后跟
   `TCP 监听` 即自愈),不需要重启主机
@@ -150,7 +152,7 @@ switch/                      sysmodule(devkitPro 工程)
   source/usb_link.c          usb:ds 双接口初始化与端点读写
   source/capture.c           grc:d 采集(H.264+PCM,SPS/PPS 注入)
   source/stream_server.c     握手 + 流发送(视频 main 线程,音频独立线程,USB/TCP 共用)
-  source/net_server.c        无线接入:TCP 串流监听 + UDP 设备发现
+  source/net_server.c        无线接入:TCP 串流监听 / TCP 文件监听 / UDP 设备发现
   source/file_server.c       SD 卡文件服务(原生 fs IPC,无堆)
   source/main.c              入口,2MB 静态堆,拉起各线程
   Makefile / swlink.json     构建配置(title id 00FF0000A53B5A57)

@@ -98,9 +98,18 @@ bool NetLink::open()
     return true;
 }
 
+void NetLink::closeFile()
+{
+    if (fileFd_ >= 0) {
+        ::close(fileFd_);
+        fileFd_ = -1;
+    }
+}
+
 void NetLink::close()
 {
     stopHeartbeat();
+    closeFile();
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
@@ -275,18 +284,131 @@ int NetLink::streamReadSome(void* data, int maxLen, unsigned timeoutMs)
     return -1;
 }
 
+/* 文件通道按需建连:只有真正操作 SD 卡时才占用设备端的第二个监听端口 */
+bool NetLink::fileEnsureOpen()
+{
+    if (fileFd_ >= 0)
+        return true;
+
+    if (ip_.empty()) {
+        snprintf(err_, sizeof(err_), "请先连接 Switch");
+        return false;
+    }
+
+    const uint16_t fport = filePort_ ? filePort_ : SWLINK_FT_TCP_PORT;
+
+    int fd = (int)socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        snprintf(err_, sizeof(err_), "创建文件通道 socket 失败: %s", strerror(errno));
+        return false;
+    }
+
+    int one = 1;
+#ifdef SO_NOSIGPIPE
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(fport);
+    if (inet_pton(AF_INET, ip_.c_str(), &addr.sin_addr) != 1) {
+        snprintf(err_, sizeof(err_), "IP 地址格式无效: %s", ip_.c_str());
+        ::close(fd);
+        return false;
+    }
+
+    const int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    int rc = ::connect(fd, (sockaddr*)&addr, sizeof(addr));
+    if (rc != 0 && errno != EINPROGRESS) {
+        snprintf(err_, sizeof(err_), "连接文件通道 %s:%u 失败: %s",
+                 ip_.c_str(), (unsigned)fport, strerror(errno));
+        ::close(fd);
+        return false;
+    }
+
+    if (rc != 0) {
+        pollfd p = { fd, POLLOUT, 0 };
+        if (poll(&p, 1, 3000) <= 0) {
+            snprintf(err_, sizeof(err_), "连接文件通道 %s:%u 超时",
+                     ip_.c_str(), (unsigned)fport);
+            ::close(fd);
+            return false;
+        }
+        int soErr = 0;
+        socklen_t sl = sizeof(soErr);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &sl);
+        if (soErr != 0) {
+            snprintf(err_, sizeof(err_), "连接文件通道 %s:%u 失败: %s",
+                     ip_.c_str(), (unsigned)fport, strerror(soErr));
+            ::close(fd);
+            return false;
+        }
+    }
+
+    fcntl(fd, F_SETFL, flags);
+    fileFd_ = fd;
+    return true;
+}
+
 int NetLink::fileReadSome(void* data, int maxLen, unsigned timeoutMs)
 {
-    (void)data; (void)maxLen; (void)timeoutMs;
-    snprintf(err_, sizeof(err_), "Wi-Fi 模式暂不支持 SD 卡文件传输(请用 USB)");
+    if (!fileEnsureOpen())
+        return -1;
+
+    pollfd p = { fileFd_, POLLIN, 0 };
+    int pr = poll(&p, 1, (int)timeoutMs);
+    if (pr == 0) return 0;
+    if (pr < 0) return (errno == EINTR) ? 0 : -1;
+
+    ssize_t n = ::recv(fileFd_, data, (size_t)maxLen, MSG_DONTWAIT);
+    if (n > 0)
+        return (int)n;
+    if (n == 0) {
+        snprintf(err_, sizeof(err_), "文件通道已被设备关闭");
+        closeFile();
+        return -1;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+        return 0;
+
+    snprintf(err_, sizeof(err_), "文件通道接收失败: %s", strerror(errno));
+    closeFile();
     return -1;
 }
 
 bool NetLink::fileWrite(const void* data, int len, unsigned timeoutMs)
 {
-    (void)data; (void)len; (void)timeoutMs;
-    snprintf(err_, sizeof(err_), "Wi-Fi 模式暂不支持 SD 卡文件传输(请用 USB)");
-    return false;
+    if (!fileEnsureOpen())
+        return false;
+
+    const uint8_t* p = (const uint8_t*)data;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+
+    while (len > 0) {
+        ssize_t n = ::send(fileFd_, p, (size_t)len, MSG_DONTWAIT);
+        if (n > 0) {
+            p += n;
+            len -= (int)n;
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            int left = remainingMs(deadline);
+            if (left <= 0) {
+                snprintf(err_, sizeof(err_), "文件通道发送超时");
+                return false;
+            }
+            pollfd po = { fileFd_, POLLOUT, 0 };
+            poll(&po, 1, left);
+            continue;
+        }
+        snprintf(err_, sizeof(err_), "文件通道发送失败: %s", strerror(errno));
+        closeFile();
+        return false;
+    }
+    return true;
 }
 
 std::vector<NetDevice> netDiscover(int timeoutMs)
@@ -349,6 +471,7 @@ std::vector<NetDevice> netDiscover(int timeoutMs)
         NetDevice dev;
         dev.ip = ip;
         dev.port = resp.tcp_port ? resp.tcp_port : SWLINK_TCP_PORT;
+        dev.filePort = resp.ft_port;
         out.push_back(dev);
     }
 

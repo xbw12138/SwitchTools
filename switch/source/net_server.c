@@ -21,6 +21,7 @@
 #include "net_server.h"
 #include "stream_server.h"
 #include "capture.h"
+#include "file_server.h"
 #include "../../protocol/swlink_protocol.h"
 
 extern void sdLog(const char* text);
@@ -36,6 +37,7 @@ static Mutex g_sockMutex;
 static Thread g_acceptThread;
 static Thread g_senderThread;
 static Thread g_discoveryThread;
+static Thread g_fileThread;
 
 static bool ensureSocket(void)
 {
@@ -369,8 +371,90 @@ static void discoveryThread(void* arg)
             memcpy(resp.magic, SWLINK_DISCOVER_RESP, sizeof(SWLINK_DISCOVER_RESP));
             resp.tcp_port = SWLINK_TCP_PORT;
             resp.proto_ver = ('1' << 8) | '0';
+            resp.ft_port = SWLINK_FT_TCP_PORT;
 
             sendto(fd, &resp, sizeof(resp), 0, (struct sockaddr*)&from, flen);
+        }
+
+        close(fd);
+    }
+}
+
+/* 文件通道:独立端口,连上后交给 file_server 循环处理请求。
+   与串流端口分开监听,互不影响;同一时刻只服务一个客户端。 */
+static void fileAcceptThread(void* arg)
+{
+    (void)arg;
+
+    sdLog("TCP 文件线程已进入");
+
+    int one = 1;
+
+    while (g_netRunning) {
+        if (!ensureSocket()) {
+            svcSleepThread(3E+9L);
+            continue;
+        }
+
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            static int logged = 0;
+            if (logged++ < 3)
+                sdLogRc("文件 socket 失败 errno", (Result)errno);
+            svcSleepThread(1E+9L);
+            continue;
+        }
+
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+        struct sockaddr_in addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons(SWLINK_FT_TCP_PORT),
+            .sin_addr.s_addr = INADDR_ANY,
+        };
+
+        if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(fd, 2) != 0) {
+            static int logged = 0;
+            if (logged++ < 3)
+                sdLogRc("文件 bind/listen 失败 errno", (Result)errno);
+            close(fd);
+            svcSleepThread(3E+9L);
+            continue;
+        }
+
+        setTimeouts(fd, 1, 1000);
+        static int listenLogged = 0;
+        if (listenLogged++ < 3)
+            sdLogRc("TCP 文件监听", SWLINK_FT_TCP_PORT);
+
+        while (g_netRunning) {
+            struct sockaddr_in peer;
+            socklen_t plen = sizeof(peer);
+            int cfd = accept(fd, (struct sockaddr*)&peer, &plen);
+
+            if (cfd < 0) {
+                if (!g_netRunning)
+                    break;
+                if (errno == ETIMEDOUT || errno == EAGAIN ||
+                    errno == EWOULDBLOCK || errno == EINTR) {
+                    continue;
+                }
+                static int errLog = 0;
+                if (errLog++ < 5)
+                    sdLogRc("文件 accept 异常 errno", (Result)errno);
+                svcSleepThread(2E+8L);
+                break;
+            }
+
+            one = 1;
+            setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            /* recv/send 超时:1s 切片,让 readFull 能周期性检查退出标志 */
+            setTimeouts(cfd, 1, 3000);
+
+            sdLog("文件客户端已接入 (TCP)");
+            fileServerNetServe(cfd);
+            close(cfd);
+            sdLog("文件客户端已断开 (TCP)");
         }
 
         close(fd);
@@ -388,6 +472,7 @@ void netServerInit(void)
     static u8 acceptStack[NET_STACK_SIZE] __attribute__((aligned(0x1000)));
     static u8 senderStack[NET_STACK_SIZE] __attribute__((aligned(0x1000)));
     static u8 discoveryStack[NET_STACK_SIZE] __attribute__((aligned(0x1000)));
+    static u8 fileStack[NET_STACK_SIZE] __attribute__((aligned(0x1000)));
 
     Result rc = threadCreate(&g_acceptThread, acceptThread, NULL,
                              acceptStack, sizeof(acceptStack), NET_THREAD_PRIO, 3);
@@ -403,6 +488,11 @@ void netServerInit(void)
                       discoveryStack, sizeof(discoveryStack), NET_THREAD_PRIO, 3);
     if (R_SUCCEEDED(rc)) rc = threadStart(&g_discoveryThread);
     sdLogRc("无线发现线程", rc);
+
+    rc = threadCreate(&g_fileThread, fileAcceptThread, NULL,
+                      fileStack, sizeof(fileStack), NET_THREAD_PRIO, 3);
+    if (R_SUCCEEDED(rc)) rc = threadStart(&g_fileThread);
+    sdLogRc("无线文件线程", rc);
 }
 
 void netServerExit(void)
