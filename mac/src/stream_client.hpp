@@ -23,10 +23,14 @@ public:
     void stop();
     bool running() const { return running_; }
 
+    /* 已接收的字节数,UI 用来显示实际码率 */
+    uint64_t bytesReceived() const { return bytes_; }
+
 private:
     void loop(VideoCb v, AudioCb a, DropCb d);
 
     Link& link_;
     std::thread th_;
     std::atomic<bool> running_{false};
+    std::atomic<uint64_t> bytes_{0};
 };

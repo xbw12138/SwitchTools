@@ -70,8 +70,10 @@ void StreamClient::loop(VideoCb vcb, AudioCb acb, DropCb dcb)
         /* 3) 再读一段进来 */
         int got = link_.streamReadSome(chunk.data(), kReadMax, 100);
         if (got < 0) break;
-        if (got > 0)
+        if (got > 0) {
+            bytes_ += (uint64_t)got;
             buf.insert(buf.end(), chunk.data(), chunk.data() + got);
+        }
 
         /* 保护:长时间只增不减说明握手/设备异常 */
         if (buf.size() > (size_t)kReadMax * 3) break;

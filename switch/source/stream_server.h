@@ -34,6 +34,9 @@ bool streamServerNetPending(void);      /* 队列里还有待发数据 */
 bool streamServerNetFlush(int fd);      /* 发送一次队列数据,false=链路出错 */
 bool streamServerNetRead(int fd);       /* 读取心跳,false=对端已关闭 */
 
+/* 无线队列统计:丢包次数与累计写入 socket 的字节数 */
+void streamServerNetStats(unsigned* dropped, u64* bytesSent);
+
 /* 握手线程暂存新会话,发送线程取走并接管(避免跨线程关闭 fd) */
 bool streamServerNetStage(int fd, bool wantVideo, bool wantAudio, uint8_t audioBatching);
 int streamServerNetTakePending(bool* wantVideo, bool* wantAudio, uint8_t* audioBatching);

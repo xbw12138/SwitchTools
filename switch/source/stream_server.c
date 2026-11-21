@@ -37,6 +37,7 @@ static u8 netTxBuf[NET_TX_BUF_SIZE];
 static size_t netTxLen = 0;    /* 队列中的有效字节数 */
 static size_t netTxSent = 0;   /* 已发出的字节数 */
 static unsigned netDropped = 0;
+static volatile u64 netBytesSent = 0;   /* 已成功写入 socket 的字节数 */
 
 /* 握手完成、等待发送线程接管的新会话。
    用单个原子槽位传递,发送线程在空闲路径上不碰任何互斥锁。 */
@@ -163,6 +164,7 @@ bool streamServerAttachNet(int fd, bool wantVideo, bool wantAudio, uint8_t audio
     netTxLen = 0;
     netTxSent = 0;
     netDropped = 0;
+    netBytesSent = 0;
     chunkLen = 0;
     chunkSent = 0;
     mutexUnlock(&queueMutex);
@@ -221,6 +223,7 @@ bool streamServerNetFlush(int fd)
     ssize_t n = send(fd, netChunk + chunkSent, chunkLen - chunkSent, 0);
     if (n > 0) {
         chunkSent += (size_t)n;
+        netBytesSent += (u64)n;
         if (chunkSent == chunkLen) {
             chunkLen = 0;
             chunkSent = 0;
@@ -237,6 +240,13 @@ bool streamServerNetFlush(int fd)
         }
     }
     return false;
+}
+
+/* 队列满时的丢包计数与累计发送量,供 net_server 周期打印 */
+void streamServerNetStats(unsigned* dropped, u64* bytesSent)
+{
+    *dropped = netDropped;
+    *bytesSent = netBytesSent;
 }
 
 /* 读取客户端发来的心跳;返回 false 表示连接已关闭 */

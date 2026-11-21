@@ -50,8 +50,8 @@ static bool ensureSocket(void)
         SocketInitConfig cfg = *socketGetDefaultInitConfig();
         cfg.tcp_tx_buf_size = 0x8000;
         cfg.tcp_rx_buf_size = 0x8000;
-        cfg.tcp_tx_buf_max_size = 0x20000;
-        cfg.tcp_rx_buf_max_size = 0x20000;
+        cfg.tcp_tx_buf_max_size = 0x40000;
+        cfg.tcp_rx_buf_max_size = 0x40000;
         cfg.udp_tx_buf_size = 0x2400;
         cfg.udp_rx_buf_size = 0x2400;
         cfg.sb_efficiency = 2;
@@ -281,16 +281,40 @@ static void senderThread(void* arg)
             continue;
         }
 
-        if (streamServerNetPending()) {
-            if (!streamServerNetFlush(fd)) {
+        /* 一次尽量排空队列:每片 32KB,连续发 8 片再让出 CPU。
+           之前每片之间固定睡 1ms,在高码率下会把发送速率压到 30MB/s 以下。 */
+        {
+            bool ok = true;
+            int guard = 0;
+            do {
+                ok = streamServerNetFlush(fd);
+                guard++;
+            } while (ok && guard < 8 && streamServerNetPending());
+
+            if (!ok) {
                 sdLog("无线发送失败, 断开");
                 streamServerDetachNet(-1);
             } else if (streamServerNetPending()) {
                 svcSleepThread(1E+6L);
+            } else if (guard == 1) {
+                svcSleepThread(2E+6L);
             }
-        } else {
-            /* 没有数据要发时短暂让出 CPU;对端断开由发送失败检测 */
-            svcSleepThread(2E+6L);
+
+            /* 每 5 秒打印一次实际写入速率与累计丢包,便于定位卡顿 */
+            static u64 lastTick = 0;
+            static u64 lastBytes = 0;
+            u64 now = svcGetSystemTick();
+            if (lastTick == 0)
+                lastTick = now;
+            if (now - lastTick >= 5ULL * 19200000ULL) {
+                unsigned drops = 0;
+                u64 bytes = 0;
+                streamServerNetStats(&drops, &bytes);
+                sdLogRc("无线发送 KB/s", (Result)((bytes - lastBytes) / 5 / 1024));
+                sdLogRc("无线丢包累计", (Result)drops);
+                lastTick = now;
+                lastBytes = bytes;
+            }
         }
     }
 

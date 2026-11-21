@@ -125,6 +125,11 @@ static int g_page = 0;          /* 0 = 串流, 1 = 文件, 2 = NRO 推送, 3 = �
 static bool g_muted = false;
 static float g_fps = 0.0f;
 
+/* 实际接收码率采样(每 0.5s 更新一次) */
+static Uint64 g_rxTick = 0;
+static uint64_t g_rxLast = 0;
+static double g_rxMBs = 0.0;
+
 static void setError(const std::string& s)
 {
     std::lock_guard<std::mutex> lk(g_errMutex);
@@ -930,12 +935,29 @@ static void drawStreamPage(SDL_Renderer* renderer)
     ImGui::SameLine(0, 18);
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
     if (g_connected) {
+        /* 实际接收码率:Wi-Fi 卡顿时先看这里,区分「设备没发」与「解码不动」 */
+        if (g_stream) {
+            const Uint64 now = SDL_GetTicks();
+            const uint64_t total = g_stream->bytesReceived();
+            if (g_rxTick == 0) {
+                g_rxTick = now;
+                g_rxLast = total;
+            } else if (now - g_rxTick >= 500) {
+                g_rxMBs = (double)(total - g_rxLast) * 1000.0 /
+                          (double)(now - g_rxTick) / (1024.0 * 1024.0);
+                g_rxTick = now;
+                g_rxLast = total;
+            }
+        }
+
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_TEXT_DIM));
-        ImGui::Text("%dx%d  ·  %.1f fps  ·  %llu 帧",
+        ImGui::Text("%dx%d  ·  %.1f fps  ·  %llu 帧  ·  %.1f MB/s",
                     g_decoder.width(), g_decoder.height(), g_fps,
-                    (unsigned long long)g_decoder.framesDecoded());
+                    (unsigned long long)g_decoder.framesDecoded(), g_rxMBs);
         ImGui::PopStyleColor();
     } else {
+        g_rxTick = 0;
+        g_rxMBs = 0.0;
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_TEXT_FAINT));
         ImGui::TextUnformatted("未连接");
         ImGui::PopStyleColor();
