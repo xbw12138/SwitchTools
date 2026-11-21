@@ -35,7 +35,6 @@ static bool g_sockReady = false;
 static Mutex g_sockMutex;
 
 static Thread g_acceptThread;
-static Thread g_senderThread;
 static Thread g_discoveryThread;
 static Thread g_fileThread;
 
@@ -114,8 +113,10 @@ static void setTimeouts(int fd, int recvSec, int sendMs)
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sv, sizeof(sv));
 }
 
+static void serveNetSession(int fd);
+
 /* 与 USB 版 stream_server.c 相同的握手顺序:发 HELLO -> 读请求 -> 回响应。
-   成功后把 fd 交给 stream_server 发送线程。 */
+   成功后把 fd 暂存,由接入线程自己接管发送。 */
 static bool doHandshake(int fd)
 {
     SwlinkHandshakeRequest req;
@@ -236,83 +237,111 @@ static void acceptThread(void* arg)
                原来的非阻塞 + 20ms 超时会在高码率下反复 EAGAIN,导致发送线程
                空转、队列被丢包,表现为画面只有几帧每秒。 */
             setTimeouts(cfd, 1, 3000);
-            sdLog("无线客户端已接入, 等待发送线程接管");
+
+            /* 显式放大发送缓冲,并打印实际生效值用于诊断 */
+            {
+                int want = 0x40000;
+                setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &want, sizeof(want));
+                int got = 0;
+                socklen_t gl = sizeof(got);
+                getsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &got, &gl);
+                sdLogRc("串流 SO_SNDBUF", (Result)got);
+            }
+            sdLog("无线客户端已接入, 本线程开始发送");
+
+            /* 会话由本线程创建,也由本线程发送,避免跨线程阻塞 send */
+            bool wantVideo = false;
+            bool wantAudio = false;
+            uint8_t batching = 0;
+            int sfd = streamServerNetTakePending(&wantVideo, &wantAudio, &batching);
+            if (sfd < 0) {
+                sdLog("无线会话暂存失败");
+                continue;
+            }
+            streamServerDetachNet(-1);
+            if (!streamServerAttachNet(sfd, wantVideo, wantAudio, batching)) {
+                sdLog("无线会话接管失败");
+                close(sfd);
+                continue;
+            }
+            serveNetSession(sfd);
         }
 
         close(fd);
     }
 }
 
-/* 发送线程:独占当前会话 fd,负责发包和探测断开。
-   新会话由 accept 线程暂存,这里关闭旧会话后接管。 */
-static void senderThread(void* arg)
+/* 在当前线程里发送整条会话。
+   套接字由 accept 线程创建,就必须由同一线程做阻塞 send:
+   实测跨线程发送时每条新连接只有 ~50KB/s,而同线程的文件通道可达 1MB/s。 */
+static void serveNetSession(int fd)
 {
-    (void)arg;
+    sdLog("无线会话已接管,开始串流");
 
-    sdLog("无线发送线程已进入");
+    static u64 lastTick = 0;
+    static u64 lastBytes = 0;
+    static u32 lastCalls = 0;
+    static u64 lastSendUs = 0;
 
     while (g_netRunning) {
-        bool wantVideo = false;
-        bool wantAudio = false;
-        uint8_t batching = 0;
+        /* 一次尽量排空队列:每片 32KB,连续发 8 片再让出 CPU */
+        bool ok = true;
+        int guard = 0;
+        do {
+            ok = streamServerNetFlush(fd);
+            guard++;
+        } while (ok && guard < 8 && streamServerNetPending());
 
-        int pending = streamServerNetTakePending(&wantVideo, &wantAudio, &batching);
-        if (pending >= 0) {
-            sdLogRc("发送线程取到会话 fd", (Result)pending);
-            streamServerDetachNet(-1);
-            if (streamServerAttachNet(pending, wantVideo, wantAudio, batching)) {
-                sdLog("无线会话已接管,开始串流");
-            } else {
-                sdLog("无线会话接管失败");
-                close(pending);
-            }
-            continue;
+        if (!ok) {
+            sdLog("无线发送失败, 断开");
+            break;
         }
 
-        int fd = streamServerNetFd();
-        if (fd < 0) {
-            svcSleepThread(5E+6L);
-            continue;
+        if (streamServerNetPending()) {
+            svcSleepThread(1E+6L);
+        } else {
+            /* 没数据要发时读一次心跳,顺便发现对端已关闭 */
+            if (!streamServerNetRead(fd)) {
+                sdLog("无线会话已断开");
+                break;
+            }
+            svcSleepThread(2E+6L);
         }
 
-        /* 一次尽量排空队列:每片 32KB,连续发 8 片再让出 CPU。
-           之前每片之间固定睡 1ms,在高码率下会把发送速率压到 30MB/s 以下。 */
-        {
-            bool ok = true;
-            int guard = 0;
-            do {
-                ok = streamServerNetFlush(fd);
-                guard++;
-            } while (ok && guard < 8 && streamServerNetPending());
+        /* 每 5 秒打印一次发送统计,便于定位卡顿 */
+        u64 now = svcGetSystemTick();
+        if (lastTick == 0)
+            lastTick = now;
+        if (now - lastTick >= 5ULL * 19200000ULL) {
+            unsigned drops = 0;
+            u64 bytes = 0;
+            u32 calls = 0, maxUs = 0, backlog = 0;
+            u64 sendUs = 0;
+            streamServerNetStats(&drops, &bytes);
+            streamServerNetDiag(&calls, &sendUs, &maxUs, &backlog);
 
-            if (!ok) {
-                sdLog("无线发送失败, 断开");
-                streamServerDetachNet(-1);
-            } else if (streamServerNetPending()) {
-                svcSleepThread(1E+6L);
-            } else if (guard == 1) {
-                svcSleepThread(2E+6L);
-            }
+            /* 会话重建时计数会归零,避免出现巨大负数 */
+            if (bytes < lastBytes) { lastBytes = bytes; lastCalls = calls; lastSendUs = sendUs; }
 
-            /* 每 5 秒打印一次实际写入速率与累计丢包,便于定位卡顿 */
-            static u64 lastTick = 0;
-            static u64 lastBytes = 0;
-            u64 now = svcGetSystemTick();
-            if (lastTick == 0)
-                lastTick = now;
-            if (now - lastTick >= 5ULL * 19200000ULL) {
-                unsigned drops = 0;
-                u64 bytes = 0;
-                streamServerNetStats(&drops, &bytes);
-                sdLogRc("无线发送 KB/s", (Result)((bytes - lastBytes) / 5 / 1024));
-                sdLogRc("无线丢包累计", (Result)drops);
-                lastTick = now;
-                lastBytes = bytes;
-            }
+            const u32 kbs = (u32)((bytes - lastBytes) / 5 / 1024);
+            const u32 dcalls = calls - lastCalls;
+            const u32 avgMs = dcalls ? (u32)((sendUs - lastSendUs) / dcalls / 1000) : 0;
+
+            sdLogRc("无线发送 KB/s", kbs);
+            sdLogRc("无线丢包累计", drops);
+            sdLogRc("无线 send 次数/5s", dcalls);
+            sdLogRc("无线 send 平均 ms", avgMs);
+            sdLogRc("无线 send 最大 ms", maxUs);
+            sdLogRc("无线队列积压 KB", backlog / 1024);
+
+            lastTick = now;
+            lastBytes = bytes;
+            lastCalls = calls;
+            lastSendUs = sendUs;
         }
     }
 
-    streamServerDetachNet(-1);
+    streamServerDetachNet(fd);
 }
 
 static void discoveryThread(void* arg)
@@ -468,6 +497,12 @@ static void fileAcceptThread(void* arg)
             setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             /* recv/send 超时:1s 切片,让 readFull 能周期性检查退出标志 */
             setTimeouts(cfd, 1, 3000);
+            {
+                int got = 0;
+                socklen_t gl = sizeof(got);
+                getsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &got, &gl);
+                sdLogRc("文件 SO_SNDBUF", (Result)got);
+            }
 
             sdLog("文件客户端已接入 (TCP)");
             fileServerNetServe(cfd);
@@ -488,7 +523,6 @@ void netServerInit(void)
     mutexInit(&g_sockMutex);
 
     static u8 acceptStack[NET_STACK_SIZE] __attribute__((aligned(0x1000)));
-    static u8 senderStack[NET_STACK_SIZE] __attribute__((aligned(0x1000)));
     static u8 discoveryStack[NET_STACK_SIZE] __attribute__((aligned(0x1000)));
     static u8 fileStack[NET_STACK_SIZE] __attribute__((aligned(0x1000)));
 
@@ -496,11 +530,6 @@ void netServerInit(void)
                              acceptStack, sizeof(acceptStack), NET_THREAD_PRIO, 3);
     if (R_SUCCEEDED(rc)) rc = threadStart(&g_acceptThread);
     sdLogRc("无线 TCP 线程", rc);
-
-    rc = threadCreate(&g_senderThread, senderThread, NULL,
-                      senderStack, sizeof(senderStack), NET_THREAD_PRIO, 3);
-    if (R_SUCCEEDED(rc)) rc = threadStart(&g_senderThread);
-    sdLogRc("无线发送线程", rc);
 
     rc = threadCreate(&g_discoveryThread, discoveryThread, NULL,
                       discoveryStack, sizeof(discoveryStack), NET_THREAD_PRIO, 3);

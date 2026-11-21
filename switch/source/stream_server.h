@@ -37,6 +37,9 @@ bool streamServerNetRead(int fd);       /* 读取心跳,false=对端已关闭 */
 /* 无线队列统计:丢包次数与累计写入 socket 的字节数 */
 void streamServerNetStats(unsigned* dropped, u64* bytesSent);
 
+/* 发送耗时诊断:调用次数 / 累计 us / 单次最大 us / 当前队列积压字节 */
+void streamServerNetDiag(u32* calls, u64* sendUs, u32* maxUs, u32* backlog);
+
 /* 握手线程暂存新会话,发送线程取走并接管(避免跨线程关闭 fd) */
 bool streamServerNetStage(int fd, bool wantVideo, bool wantAudio, uint8_t audioBatching);
 int streamServerNetTakePending(bool* wantVideo, bool* wantAudio, uint8_t* audioBatching);

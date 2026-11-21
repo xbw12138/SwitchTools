@@ -33,11 +33,16 @@ static void logWriteFail(size_t written, size_t expected)
 /* 无线发送队列:采集线程只入队,TCP 会话线程异步发送。
    队列满时整包丢弃,保证网络拥塞不会阻塞视频采集线程。 */
 #define NET_TX_BUF_SIZE (1024 * 1024)
-static u8 netTxBuf[NET_TX_BUF_SIZE];
+/* BSD socket 的收发缓冲必须页对齐:非对齐缓冲会导致 TCP 重传爆炸,
+   实测同样链路上文件通道(4KB 对齐)能跑 1MB/s,而串流只有 50KB/s */
+static alignas(0x1000) u8 netTxBuf[NET_TX_BUF_SIZE];
 static size_t netTxLen = 0;    /* 队列中的有效字节数 */
 static size_t netTxSent = 0;   /* 已发出的字节数 */
 static unsigned netDropped = 0;
 static volatile u64 netBytesSent = 0;   /* 已成功写入 socket 的字节数 */
+static volatile u32 netFlushCalls = 0;  /* flush 调用次数 */
+static volatile u64 netSendUs = 0;      /* send 累计耗时(us) */
+static volatile u32 netSendMaxUs = 0;   /* 单次 send 最大耗时(us) */
 
 /* 握手完成、等待发送线程接管的新会话。
    用单个原子槽位传递,发送线程在空闲路径上不碰任何互斥锁。 */
@@ -49,7 +54,7 @@ static volatile int netFdPub = -1;
 /* 发送线程独占的待发块:把数据从共享队列拷出来后立刻释放锁,
    避免 send 阻塞时把采集线程和握手线程一起卡住 */
 #define NET_CHUNK_SIZE 0x8000
-static u8 netChunk[NET_CHUNK_SIZE];
+static alignas(0x1000) u8 netChunk[NET_CHUNK_SIZE];
 static size_t chunkLen = 0;
 static size_t chunkSent = 0;
 
@@ -165,6 +170,9 @@ bool streamServerAttachNet(int fd, bool wantVideo, bool wantAudio, uint8_t audio
     netTxSent = 0;
     netDropped = 0;
     netBytesSent = 0;
+    netFlushCalls = 0;
+    netSendUs = 0;
+    netSendMaxUs = 0;
     chunkLen = 0;
     chunkSent = 0;
     mutexUnlock(&queueMutex);
@@ -220,7 +228,15 @@ bool streamServerNetFlush(int fd)
             return true;
     }
 
+    const u64 tSend0 = svcGetSystemTick();
     ssize_t n = send(fd, netChunk + chunkSent, chunkLen - chunkSent, 0);
+    {
+        /* 19200 tick = 1ms */
+        const u32 us = (u32)((svcGetSystemTick() - tSend0) * 1000000ULL / 19200000ULL);
+        netSendUs += us;
+        netSendMaxUs = us > netSendMaxUs ? us : netSendMaxUs;
+        netFlushCalls++;
+    }
     if (n > 0) {
         chunkSent += (size_t)n;
         netBytesSent += (u64)n;
@@ -249,6 +265,15 @@ void streamServerNetStats(unsigned* dropped, u64* bytesSent)
     *bytesSent = netBytesSent;
 }
 
+/* 发送耗时诊断:调用次数 / 累计 us / 单次最大 us / 当前队列积压 */
+void streamServerNetDiag(u32* calls, u64* sendUs, u32* maxUs, u32* backlog)
+{
+    *calls = netFlushCalls;
+    *sendUs = netSendUs;
+    *maxUs = netSendMaxUs;
+    *backlog = (u32)netTxLen;
+}
+
 /* 读取客户端发来的心跳;返回 false 表示连接已关闭 */
 bool streamServerNetRead(int fd)
 {
@@ -270,8 +295,10 @@ static bool netEnqueueLocked(const void* data, size_t length)
     if (netTxSent == netTxLen) {
         netTxSent = 0;
         netTxLen = 0;
-    } else if (netTxSent > 0 && NET_TX_BUF_SIZE - netTxLen < length) {
-        /* 回收已发送部分,腾出尾部空间 */
+    } else if (netTxSent > 0 && NET_TX_BUF_SIZE - netTxLen < length &&
+               NET_TX_BUF_SIZE - netTxLen + netTxSent >= length) {
+        /* 只有回收后确实能放下才搬运:队满时每包一次 1MB memmove 会把
+           同核上的发送线程一起拖慢,进而让队列更满、丢得更多 */
         memmove(netTxBuf, netTxBuf + netTxSent, netTxLen - netTxSent);
         netTxLen -= netTxSent;
         netTxSent = 0;
