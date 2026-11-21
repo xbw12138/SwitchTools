@@ -7,11 +7,11 @@ description: 通过 USB 读写 Switch SD 卡的命令行工具 swlink-cli 的使
 
 `swlink-cli` 与 SwLink.app 共用同一套 USB 协议，直接读写 Switch 的 SD 卡，无需局域网、无需进入 hbmenu。
 
-配套资源（相对仓库根）：
+配套资源（与本文件同目录；仓库内位于 `skills/swlink-cli/`）：
 
-- `skills/swlink-cli/scripts/smoke-test.sh` — 一键冒烟测试
-- `skills/swlink-cli/references/protocol.md` — USB 文件协议与固件实现约束
-- `skills/swlink-cli/references/troubleshooting.md` — 完整排障手册
+- `scripts/smoke-test.sh` — 一键冒烟测试
+- `references/protocol.md` — USB 文件协议与固件实现约束
+- `references/troubleshooting.md` — 完整排障手册
 
 ## 前置条件
 
@@ -101,8 +101,8 @@ cmake --build build -j4          # 产物: mac/build/swlink-cli
 改了客户端或固件后跑一次：
 
 ```sh
-bash skills/swlink-cli/scripts/smoke-test.sh            # 默认用 ./mac/build/swlink-cli
-bash skills/swlink-cli/scripts/smoke-test.sh <cli 路径>
+bash scripts/smoke-test.sh            # 默认用 ./mac/build/swlink-cli
+bash scripts/smoke-test.sh <cli 路径>
 ```
 
 脚本会依次验证：连接与容量 → 上传 1B/64KB/5MB → 远端尺寸 → 递归下载与校验和比对 → 重命名 → 清理，全部通过时打印 `PASS`。
@@ -132,7 +132,7 @@ md5 -q /tmp/t.bin /tmp/t2.bin                              # 两行必须相同
 | 锁屏唤醒后设备消失/连不上 | 唤醒后监听 socket 会失效，设备端 200ms 后自动重建；等 1~2 秒重试，日志出现 `TCP accept 异常 errno` 后跟 `TCP 监听` 即正常 |
 | 开机后 SD 卡上没有 `SwLink.log` | sysmodule 未加载（多因 NPDM 能力声明被固件拒绝）；换 1.1.0 及以后的包 |
 
-细节与逐步排查见 `skills/swlink-cli/references/troubleshooting.md`。
+细节与逐步排查见 `references/troubleshooting.md`。
 
 ## 注意
 
